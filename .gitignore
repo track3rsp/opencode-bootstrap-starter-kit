@@ -1,0 +1,14 @@
+workspace/
+
+.DS_Store
+Thumbs.db
+
+.vscode/
+.idea/
+
+*.log
+
+.env
+.env.*
+
+__pycache__/
