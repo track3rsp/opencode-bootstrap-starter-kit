@@ -198,9 +198,35 @@ Architecture assumptions.
 
 Technology recommendations.
 
+AI Development Preferences.
+
 Risks.
 
 Future evolution.
+
+AI Development Preferences define how the AI should collaborate during the entire lifetime of the project.
+
+Typical preferences include:
+
+Conversation language.
+
+Documentation language.
+
+Code comment language.
+
+Commit message language.
+
+Identifier naming conventions.
+
+Communication style.
+
+Reasoning verbosity.
+
+Output formatting preferences.
+
+These preferences should be inferred from USER.md whenever possible.
+
+If the user explicitly specifies them later, PROJECT_PROFILE.md must be updated accordingly.
 
 Every statement inside PROJECT_PROFILE.md must be traceable to USER.md or to explicit clarification questions.
 
@@ -213,6 +239,10 @@ Resolve duplicated information automatically.
 Resolve contradictions whenever possible.
 
 Ask questions only when they affect architecture.
+
+AI Development Preferences are an exception.
+
+If the user's preferred way of collaborating with the AI cannot be inferred with reasonable confidence from USER.md, ask only the minimum questions required to complete the AI Development Preferences section of PROJECT_PROFILE.md.
 
 After PROJECT_PROFILE.md has been generated, USER.md should no longer be used during normal project generation unless PROJECT_PROFILE.md must be regenerated.
 
@@ -961,23 +991,21 @@ Document them.
 
 
 
-# PROJECT PROFILE GENERATION
+# PROJECT PROFILE
 
-PROJECT_PROFILE.md is the formal output of the discovery phase.
+PROJECT_PROFILE.md is now the authoritative specification of the repository.
 
-Before generating any architecture, documentation or source code you must first generate PROJECT_PROFILE.md.
+Every generated artifact must derive its information from PROJECT_PROFILE.md.
 
-PROJECT_PROFILE.md must contain only validated information.
+USER.md should no longer be consulted during repository generation except when regenerating PROJECT_PROFILE.md after major requirement changes.
 
-Every architectural decision must be traceable to:
+PROJECT_PROFILE.md also defines the permanent AI Development Preferences for the project.
 
-- USER.md
+Whenever project prompts, documentation or implementation decisions depend on communication preferences, language preferences or AI collaboration preferences, they must follow PROJECT_PROFILE.md.
 
-or
+Do not duplicate these preferences across multiple documents.
 
-- explicit clarification questions.
-
-PROJECT_PROFILE.md becomes the official project specification used by the remainder of the Bootstrap process.
+PROJECT_PROFILE.md is the single source of truth for AI Development Preferences.
 
 
 
@@ -1306,6 +1334,38 @@ PROJECT_PROFILE.md is now the authoritative specification of the repository.
 Every generated artifact must derive its information from PROJECT_PROFILE.md.
 
 USER.md should no longer be consulted during repository generation except when regenerating PROJECT_PROFILE.md after major requirement changes.
+
+
+
+# AI DEVELOPMENT PREFERENCES
+
+PROJECT_PROFILE.md contains a dedicated section named "AI Development Preferences".
+
+This section defines how the AI should collaborate throughout the lifetime of the project.
+
+Typical preferences include:
+
+Conversation language.
+
+Documentation language.
+
+Code comment language.
+
+Commit message language.
+
+Identifier naming conventions.
+
+Communication style.
+
+Reasoning verbosity.
+
+Output formatting preferences.
+
+Whenever possible, infer these preferences from USER.md.
+
+If the user later changes any of these preferences, PROJECT_PROFILE.md must be updated accordingly.
+
+All generated project prompts must follow the AI Development Preferences defined in PROJECT_PROFILE.md.
 
 
 
@@ -2208,6 +2268,8 @@ Continue development safely.
 
 Responsibilities:
 
+Read PROJECT_PROFILE.
+
 Read documentation.
 
 Read changelog.
@@ -2217,6 +2279,8 @@ Read roadmap.
 Read current tasks.
 
 Read architectural decisions.
+
+Apply the AI Development Preferences defined in PROJECT_PROFILE.md before interacting with the user or generating documentation.
 
 Resume work without changing project direction.
 
@@ -2351,6 +2415,8 @@ Never ship undocumented changes.
 Every generated project prompt must:
 
 Read PROJECT_CONSTITUTION.
+
+Read PROJECT_PROFILE.
 
 Read AI_HANDOFF.
 
