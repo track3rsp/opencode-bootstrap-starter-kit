@@ -528,22 +528,35 @@ export function createServerInstance(deps?: ServerDeps): http.Server {
           return;
         }
 
-        // If SMTP is configured, attempt to send the magic-link email. Use a
-        // lazy import so we don't require nodemailer in environments that don't
-        // have it installed (tests/dev). If SMTP not configured, return ok as
-        // a passive response (previous behavior).
-        const smtpHost = process.env.WORLDCORE_SMTP_HOST;
-        if (smtpHost) {
+        // Determine how to send email: support 'smtp' and 'sendmail' via
+        // WORLDCORE_EMAIL_TYPE or legacy WORLDCORE_SMTP_HOST env. Default is
+        // passive-ok (return {ok:true}) when no transport is configured.
+        const emailTypeRaw = (process.env.WORLDCORE_EMAIL_TYPE || (process.env.WORLDCORE_SMTP_HOST ? 'smtp' : '')).toLowerCase();
+        const emailType = emailTypeRaw || '';
+
+        if (emailType === 'smtp' || emailType === 'sendmail') {
           try {
+            // Lazy import avoids forcing nodemailer in environments where it's
+            // not installed. We declare the module in src/types to silence TS.
             const nodemailer = await import('nodemailer');
-            const smtpPort = parseInt(process.env.WORLDCORE_SMTP_PORT || '587', 10);
-            const smtpSecure = String(process.env.WORLDCORE_SMTP_SECURE || 'false') === 'true' || process.env.WORLDCORE_SMTP_SECURE === '1';
-            const smtpUser = process.env.WORLDCORE_SMTP_USER;
-            const smtpPass = process.env.WORLDCORE_SMTP_PASS;
-            const fromAddr = process.env.WORLDCORE_SMTP_FROM || `WorldCore <no-reply@localhost>`;
-            const transportOpts: any = { host: smtpHost, port: smtpPort, secure: smtpSecure };
-            if (smtpUser) transportOpts.auth = { user: smtpUser, pass: smtpPass };
-            const transporter = nodemailer.createTransport(transportOpts as any);
+            let transporter: any;
+
+            if (emailType === 'sendmail') {
+              const sendmailPath = process.env.WORLDCORE_SENDMAIL_PATH || '/usr/sbin/sendmail';
+              transporter = nodemailer.createTransport({ sendmail: true, newline: 'unix', path: sendmailPath } as any);
+            } else {
+              const smtpHost2 = process.env.WORLDCORE_SMTP_HOST!;
+              // prefer explicit secure flag, fall back to port 465 detection
+              const smtpPort = parseInt(process.env.WORLDCORE_SMTP_PORT || process.env.WORLDCORE_SMTP_PORT_SSL_TLS || '587', 10);
+              const smtpSecureRaw = process.env.WORLDCORE_SMTP_SECURE;
+              const smtpSecure = smtpSecureRaw ? (String(smtpSecureRaw) === '1' || String(smtpSecureRaw).toLowerCase() === 'true') : smtpPort === 465;
+              const smtpUser = process.env.WORLDCORE_SMTP_USER;
+              const smtpPass = process.env.WORLDCORE_SMTP_PASS;
+              const fromAddr = process.env.WORLDCORE_SMTP_FROM || `WorldCore <no-reply@localhost>`;
+              const transportOpts: any = { host: smtpHost2, port: smtpPort, secure: smtpSecure };
+              if (smtpUser) transportOpts.auth = { user: smtpUser, pass: smtpPass };
+              transporter = nodemailer.createTransport(transportOpts as any);
+            }
 
             const externalBase = process.env.WORLDCORE_EXTERNAL_URL || `http://localhost:${PORT}`;
             const verifyUrl = `${externalBase.replace(/\/$/, '')}/api/auth/magic-link/verify?token=${encodeURIComponent(token)}`;
@@ -552,7 +565,7 @@ export function createServerInstance(deps?: ServerDeps): http.Server {
             const text = `Hello,\n\nUse this link to sign in: ${verifyUrl}\n\nThis link expires in approximately ${ttlMin} minutes.\n`;
             const html = `<p>Hello,</p><p>Use this link to sign in: <a href="${verifyUrl}">${verifyUrl}</a></p><p>This link expires in approximately ${ttlMin} minutes.</p>`;
 
-            const info = await transporter.sendMail({ from: fromAddr, to: email, subject, text, html });
+            const info = await transporter.sendMail({ from: process.env.WORLDCORE_SMTP_FROM || `WorldCore <no-reply@localhost>`, to: email, subject, text, html });
             try { logger.info('auth.magic_link_sent', { email, messageId: info && (info as any).messageId ? (info as any).messageId : undefined }); } catch (e) {}
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ ok: true }));
@@ -566,7 +579,7 @@ export function createServerInstance(deps?: ServerDeps): http.Server {
           }
         }
 
-        // Production without SMTP configured: return generic ok (legacy behavior).
+        // No email transport configured: legacy behavior — return generic ok.
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
         return;
