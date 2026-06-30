@@ -4,13 +4,17 @@ import url from 'node:url';
 import { SqlitePersistenceAdapter } from '../sqlite/sqlitePersistence.js';
 import { FilePersistenceAdapter } from '../fs/filePersistence.js';
 import { PersistenceService } from '../../application/persistenceService.js';
-import { UniverseService } from '../../application/universeService.js';
+import { WorldService } from '../../application/worldService.js';
 import { MockAiProvider } from '../ai/mockAiProvider.js';
 import logger from '../../utils/logger.js';
 import { hashPassword, verifyPassword, isArgon2Available } from '../../utils/password.js';
 import { hashToken } from '../../utils/crypto.js';
+import { buildWorldContext, compactMessages } from '../../application/contextBuilder.js';
 
-const PORT = parseInt(process.env.WORLDCORE_HTTP_PORT || '3000', 10);
+// Default development HTTP port. For local development and testing we use 3001
+// to avoid colliding with user-running instances on 3000. This can be
+// overridden by setting WORLDCORE_HTTP_PORT in your environment or .env.
+const PORT = parseInt(process.env.WORLDCORE_HTTP_PORT || '3001', 10);
 
 // Rate limiter support: default in-memory implementation with optional
 // Redis-backed limiter (set WORLDCORE_RATE_LIMIT_BACKEND=redis and
@@ -20,6 +24,8 @@ let _inMemoryRateMap = new Map<string, { count: number; windowStart: number }>()
 let _redisLimiterFactory: any = null;
 // Per-email rate limiter (in-memory). Keyed by normalized email.
 let _emailRateMap = new Map<string, { count: number; windowStart: number }>();
+// In-memory presence store (per-universe/world). Map<universeId, Map<userId, { lastSeen, accumulatedMs, joinedAt }>>
+const _presenceStore: Map<string, Map<string, { lastSeen: number; accumulatedMs: number; joinedAt?: number }>> = new Map();
 
 async function checkRateLimit(ip: string) {
   const RATE_LIMIT_PER_MIN = process.env.WORLDCORE_RATE_LIMIT_PER_MIN ? parseInt(process.env.WORLDCORE_RATE_LIMIT_PER_MIN, 10) : 0;
@@ -54,7 +60,7 @@ async function checkRateLimit(ip: string) {
   return { ok: true };
 }
 
-async function checkEmailRateLimit(email: string) {
+  async function checkEmailRateLimit(email: string) {
   const RATE_LIMIT_PER_MIN = process.env.WORLDCORE_MAGIC_LINK_RATE_LIMIT_PER_MIN ? parseInt(process.env.WORLDCORE_MAGIC_LINK_RATE_LIMIT_PER_MIN, 10) : 5;
   if (!RATE_LIMIT_PER_MIN || RATE_LIMIT_PER_MIN <= 0) return { ok: true };
   const now = Date.now();
@@ -70,6 +76,12 @@ async function checkEmailRateLimit(email: string) {
   }
   entry.count += 1;
   return { ok: true };
+}
+
+  function ensurePresenceMap(worldId: string) {
+  let m = _presenceStore.get(worldId);
+  if (!m) { m = new Map(); _presenceStore.set(worldId, m); }
+  return m;
 }
 
 // Simple JWT HS256 verification (no external dependency). Returns payload if
@@ -136,7 +148,7 @@ export function createServerInstance(deps?: ServerDeps): http.Server {
     }
   }
   const persistence = new PersistenceService(adapter);
-  const universeService = new UniverseService(persistence);
+  const worldService = new WorldService(persistence);
   // AI provider: may be passed in deps (tests) or created lazily when needed.
   let aiProvider = deps?.aiProvider;
   async function getAiProvider() {
@@ -153,6 +165,36 @@ export function createServerInstance(deps?: ServerDeps): http.Server {
   async function getAiProviderForRequest(req: http.IncomingMessage, profile?: string) {
     // If tests inject a provider, use it (keeps tests deterministic)
     if (deps?.aiProvider) return deps.aiProvider;
+
+    // Helper: wrap a provider's generate method so it injects a language
+    // instruction based on the incoming request header 'x-wc-lang' or opts.lang.
+    function wrapProviderWithLang(provider: any) {
+      try {
+        if (!provider || (provider as any).__wc_lang_wrapped) return provider;
+        const orig = provider.generate && provider.generate.bind(provider);
+        if (typeof orig !== 'function') return provider;
+        provider.generate = async function(prompt: any, opts: any) {
+          try {
+            const headerLang = String(req.headers['x-wc-lang'] || '').trim();
+            const optLang = opts && opts.lang ? String(opts.lang).trim() : '';
+            const lang = optLang || headerLang || null;
+            if (lang) {
+              if (opts && Array.isArray(opts.messages)) {
+                const insertIdx = (opts.messages.length && opts.messages[0] && opts.messages[0].role === 'system') ? 1 : 0;
+                opts.messages.splice(insertIdx, 0, { role: 'system', content: `Respond in the user's language: ${lang}.` });
+              } else if (typeof prompt === 'string') {
+                prompt = `Respond in the user's language: ${lang}.\n\n` + prompt;
+              }
+            }
+          } catch (e) {
+            // ignore injection errors
+          }
+          return orig(prompt, opts);
+        };
+        (provider as any).__wc_lang_wrapped = true;
+      } catch (e) {}
+      return provider;
+    }
 
     const actorUser = getRequesterId(req);
     if (actorUser) {
@@ -172,14 +214,16 @@ export function createServerInstance(deps?: ServerDeps): http.Server {
           } catch (e) {
             // ignore logging errors
           }
-          return await mod.createAiProviderForKey(user.apiKey, userModel);
+          const prov = await mod.createAiProviderForKey(user.apiKey, userModel);
+          return wrapProviderWithLang(prov);
         }
       } catch (e) {
         // ignore and fall back
       }
     }
 
-    return getAiProvider();
+    const globalProv = await getAiProvider();
+    return wrapProviderWithLang(globalProv);
   }
 
   // In-memory store for dev magic links: token -> { email, expiresAt }
@@ -375,42 +419,9 @@ export function createServerInstance(deps?: ServerDeps): http.Server {
     return undefined;
   }
 
-  function buildUniverseContext(snapshot: any, events: any[], maxEvents = 6) {
-    const chars = (snapshot.characters ?? []).map((c: any) => `- ${c.name} (${c.id})${c.description ? `: ${c.description}` : ''}`).join('\n');
-    const recent = (events || []).slice(-maxEvents).map((e: any) => `- [${e.timestamp}] ${e.type}: ${JSON.stringify(e.payload)}`).join('\n');
-    const attrs = snapshot.attributes ? JSON.stringify(snapshot.attributes) : 'none';
-    return `Universe: ${snapshot.name} (id: ${snapshot.id})\nDescription: ${snapshot.description ?? 'none'}\nAttributes: ${attrs}\nCharacters:\n${chars || '- none'}\nRecent events:\n${recent || '- none'}\n`;
-  }
-
-  // Compact messages to avoid sending enormous contexts to the AI provider.
-  // This keeps the most recent messages and inserts a system note when older
-  // content is omitted. The charLimit is conservative (in characters) — you
-  // can adjust it according to model limits. We operate on message.content
-  // lengths as an approximation for token usage.
-  function compactMessages(messages: Array<any>, charLimit = 120000): Array<any> {
-    try {
-      if (!messages || !messages.length) return messages;
-      let total = 0;
-      for (const m of messages) total += String(m.content || '').length;
-      if (total <= charLimit) return messages;
-      const out: Array<any> = [];
-      let acc = 0;
-      // keep the most recent messages until we hit the limit
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const m = messages[i];
-        const len = String(m.content || '').length;
-        if (acc + len > charLimit) {
-          out.unshift({ role: 'system', content: '... older content truncated due to length ...' });
-          break;
-        }
-        out.unshift(m);
-        acc += len;
-      }
-      return out;
-    } catch (e) {
-      return messages;
-    }
-  }
+  // Context generation and message compaction are provided by the centralized
+  // Context Builder (application responsibility). See
+  // src/application/contextBuilder.ts for implementation.
 
   function requireAuth(req: http.IncomingMessage, res: http.ServerResponse): boolean {
     // If no auth configured, allow all requests (legacy/dev behavior).
@@ -536,42 +547,15 @@ export function createServerInstance(deps?: ServerDeps): http.Server {
 
         if (emailType === 'smtp' || emailType === 'sendmail') {
           try {
-            // Lazy import avoids forcing nodemailer in environments where it's
-            // not installed. We declare the module in src/types to silence TS.
-            const nodemailer = await import('nodemailer');
-            let transporter: any;
-
-            if (emailType === 'sendmail') {
-              const sendmailPath = process.env.WORLDCORE_SENDMAIL_PATH || '/usr/sbin/sendmail';
-              transporter = nodemailer.createTransport({ sendmail: true, newline: 'unix', path: sendmailPath } as any);
-            } else {
-              const smtpHost2 = process.env.WORLDCORE_SMTP_HOST!;
-              // prefer explicit secure flag, fall back to port 465 detection
-              const smtpPort = parseInt(process.env.WORLDCORE_SMTP_PORT || process.env.WORLDCORE_SMTP_PORT_SSL_TLS || '587', 10);
-              const smtpSecureRaw = process.env.WORLDCORE_SMTP_SECURE;
-              const smtpSecure = smtpSecureRaw ? (String(smtpSecureRaw) === '1' || String(smtpSecureRaw).toLowerCase() === 'true') : smtpPort === 465;
-              const smtpUser = process.env.WORLDCORE_SMTP_USER;
-              const smtpPass = process.env.WORLDCORE_SMTP_PASS;
-              const fromAddr = process.env.WORLDCORE_SMTP_FROM || `WorldCore <no-reply@localhost>`;
-              const transportOpts: any = { host: smtpHost2, port: smtpPort, secure: smtpSecure };
-              if (smtpUser) transportOpts.auth = { user: smtpUser, pass: smtpPass };
-              transporter = nodemailer.createTransport(transportOpts as any);
-            }
-
-            const externalBase = process.env.WORLDCORE_EXTERNAL_URL || `http://localhost:${PORT}`;
-            const verifyUrl = `${externalBase.replace(/\/$/, '')}/api/auth/magic-link/verify?token=${encodeURIComponent(token)}`;
-            const ttlMin = Math.round((parseInt(process.env.WORLDCORE_MAGIC_LINK_TTL_MS || String(15 * 60 * 1000), 10) / 60000));
-            const subject = 'Your WorldCore magic link';
-            const text = `Hello,\n\nUse this link to sign in: ${verifyUrl}\n\nThis link expires in approximately ${ttlMin} minutes.\n`;
-            const html = `<p>Hello,</p><p>Use this link to sign in: <a href="${verifyUrl}">${verifyUrl}</a></p><p>This link expires in approximately ${ttlMin} minutes.</p>`;
-
-            const info = await transporter.sendMail({ from: process.env.WORLDCORE_SMTP_FROM || `WorldCore <no-reply@localhost>`, to: email, subject, text, html });
+            // Use the email helper which wraps nodemailer and is lazy.
+            const mod = await import('../../utils/emailSender.js');
+            const sendMagicLinkEmail = mod.sendMagicLinkEmail as (email: string, token: string, opts?: any) => Promise<any>;
+            const info = await sendMagicLinkEmail(email, token, { externalBase: process.env.WORLDCORE_EXTERNAL_URL, ttlMs });
             try { logger.info('auth.magic_link_sent', { email, messageId: info && (info as any).messageId ? (info as any).messageId : undefined }); } catch (e) {}
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ ok: true }));
             return;
           } catch (err) {
-            // Sending failed — attempt to remove persisted token and report error.
             try { await persistence.deleteMagicLink(token); } catch (e) {}
             res.writeHead(500, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ error: 'send_failed', message: err instanceof Error ? err.message : String(err) }));
@@ -819,13 +803,13 @@ export function createServerInstance(deps?: ServerDeps): http.Server {
             openapi: '3.0.0',
             info: { title: 'WorldCore API', version: '0.1.0' },
             paths: {
-              '/api/universes': { get: { summary: 'List universes' } },
+              '/api/worlds': { get: { summary: 'List worlds' } },
               '/api/models': { get: { summary: 'List model aliases' }, post: { summary: 'Create model alias', security: [{ ApiKeyAuth: [] }] } },
               '/api/models/{id}': { get: { summary: 'Get model alias' }, put: { summary: 'Update model alias', security: [{ ApiKeyAuth: [] }] }, delete: { summary: 'Delete model alias', security: [{ ApiKeyAuth: [] }] } },
-              '/api/universe/{id}': { get: { summary: 'Get universe snapshot' } },
-              '/api/universe': { post: { summary: 'Create universe', security: [{ ApiKeyAuth: [] }, { bearerAuth: [] }] } },
-              '/api/universe/{id}/character': { post: { summary: 'Add character', security: [{ ApiKeyAuth: [] }, { bearerAuth: [] }] } },
-              '/api/universe/{id}/ai': { post: { summary: 'Ask AI scoped to universe' } },
+              '/api/world/{id}': { get: { summary: 'Get world snapshot' } },
+              '/api/world': { post: { summary: 'Create world', security: [{ ApiKeyAuth: [] }, { bearerAuth: [] }] } },
+              '/api/world/{id}/character': { post: { summary: 'Add character', security: [{ ApiKeyAuth: [] }, { bearerAuth: [] }] } },
+              '/api/world/{id}/ai': { post: { summary: 'Ask AI scoped to world' } },
               '/api/ai': { post: { summary: 'Ask AI (global, optional universeId in body)' } },
             },
             components: {
@@ -915,12 +899,54 @@ export function createServerInstance(deps?: ServerDeps): http.Server {
 <style>
 body{padding:1rem}
 #layout{display:flex;gap:1rem}
-#sidebar{flex:1;border:1px solid #ddd;padding:1rem;border-radius:6px}
-#main{flex:2;border:1px solid #ddd;padding:1rem;border-radius:6px}
+#sidebar{flex:1;border:1px solid #ddd;padding:1rem;border-radius:6px;background:#fff}
+#main{flex:2;border:1px solid #ddd;padding:1rem;border-radius:6px;background:#fff}
 pre{background:#f7f7f7;padding:.5rem;overflow:auto;white-space:pre-wrap}
-body.dark{background:#111;color:#eee}
-body.dark pre{background:#222;color:#ddd}
-.settings-panel{position:fixed;right:1rem;top:4rem;width:320px;z-index:1000}
+
+/* Dark theme overrides: use !important where needed to override inline
+   or bootstrap defaults so all form controls and containers become dark */
+body.dark{background:#0b0b0b;color:#e6e6e6}
+
+/* Keep AI response pre as green-on-black for diagnostics */
+body.dark pre{background:#000;color:#0f0}
+
+/* Timeline / log / debug containers: force dark backgrounds and readable text */
+body.dark #eventsContainer,
+body.dark #logViewer,
+body.dark #debugPane { background:#0b0b0b !important; color:#d0d0d0 !important; border-color:#222 !important }
+body.dark #eventsContainer ul, body.dark #eventsContainer li { background:transparent !important; color:#d0d0d0 !important }
+body.dark #logList li, body.dark #debugList li { color:#d0d0d0 !important }
+body.dark .text-muted { color:#9a9a9a !important }
+
+/* Darken cards, sidebars and main area */
+body.dark #sidebar,
+body.dark #main,
+body.dark .card,
+body.dark .settings-panel,
+body.dark #charModal .card { background:#0b0b0b !important; color:#e6e6e6 !important; border:1px solid #222 !important }
+
+/* Form controls and selects in dark mode: force background/color/border */
+body.dark input.form-control,
+body.dark textarea.form-control,
+body.dark select.form-select,
+body.dark .form-select,
+body.dark .form-control { background:#111 !important; color:#e6e6e6 !important; border-color:#333 !important }
+body.dark input.form-control::placeholder,
+body.dark textarea.form-control::placeholder { color:#777 !important }
+
+/* Navbar (overrides bootstrap bg-light) */
+body.dark .navbar, body.dark .bg-light { background:#0b0b0b !important; color:#e6e6e6 !important; border-color:#222 !important }
+body.dark .navbar-brand { color:#e6e6e6 !important }
+
+/* Buttons and labels */
+body.dark .btn, body.dark .btn-outline-secondary, body.dark .btn-sm { color:#e6e6e6 !important }
+body.dark .form-check-label { color:#e6e6e6 !important }
+
+/* Character list links */
+body.dark #chars li a { color:#9fe3a6 !important }
+
+/* Settings panel: keep scrollable */
+.settings-panel{position:fixed;right:1rem;top:4rem;width:320px;max-height:calc(100vh - 6rem);overflow:auto;-webkit-overflow-scrolling:touch;z-index:1000}
 </style></head><body>
 <nav class="navbar navbar-light bg-light mb-3">
     <div class="container-fluid">
@@ -935,32 +961,102 @@ body.dark pre{background:#222;color:#ddd}
   <div id="alerts" class="position-fixed top-0 end-0 p-3" style="z-index:1050"></div>
 <div id="layout">
   <div id="sidebar">
-    <div class="mb-2">
-      <label id="labelUniverse" class="form-label">Universo</label>
-      <select id="universeSelect" class="form-select"></select>
+    <div class="mb-2 d-flex align-items-start">
+        <div style="flex:1">
+        <label id="labelWorld" class="form-label">Mundo</label>
+        <select id="worldSelect" class="form-select"></select>
+      </div>
+      <div class="ms-2" style="margin-top:1.5rem">
+        <button id="openUniverseSettings" class="btn btn-sm btn-outline-secondary" title="World settings">⚙️</button>
+      </div>
     </div>
     <div class="mb-2"><button id="loadBtn" class="btn btn-sm btn-secondary">Cargar</button></div>
-    <div class="mb-2"><button id="openLogViewer" class="btn btn-sm btn-outline-info">Logs</button></div>
+    <div class="mb-2 d-flex gap-2">
+      <button id="openLogViewer" class="btn btn-sm btn-outline-info">Logs</button>
+      <button id="openGlobalChars" class="btn btn-sm btn-outline-secondary">Global</button>
+    </div>
     <hr/>
     <h5 id="charsHeader">Personajes</h5>
     <ul id="chars" class="list-unstyled"></ul>
+    <div id="createCharBlock" class="mt-2">
+      <h6 class="mb-1">Crear personaje</h6>
+      <input id="newCharId" class="form-control mb-1" placeholder="id (p.ej. bob)" />
+      <input id="newCharName" class="form-control mb-1" placeholder="Nombre de personaje" />
+      <input id="newCharDesc" class="form-control mb-1" placeholder="Descripción (opcional)" />
+      <div class="d-flex gap-2"><button id="createCharBtn" class="btn btn-sm btn-success">Crear personaje</button></div>
+    </div>
     <hr/>
     <div class="form-check"><input type="checkbox" id="autoRefresh" class="form-check-input"/><label id="autoRefreshLabel" class="form-check-label">Auto-refresh</label></div>
   </div>
   <div id="main">
     <h5 id="timelineTitle">Timeline (últimos eventos)</h5>
     <div id="eventsContainer" style="max-height:320px;overflow:auto;border:1px solid #eee;padding:.5rem;border-radius:4px;background:#fafafa">
-      <ul id="events" class="list-unstyled mb-0"><li class="text-muted">- seleccione un universo -</li></ul>
+      <ul id="events" class="list-unstyled mb-0"><li class="text-muted">- seleccione un mundo -</li></ul>
     </div>
+
+    <!-- World-level AI defaults modal: opened via gear button next to world selector -->
+    <div id="worldSettingsModalOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:1060;">
+      <div id="worldAiDefaultsBlock" class="card" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:520px;max-width:95%;">
+        <div class="card-body">
+          <h6 id="worldAiDefaultsTitle" class="card-title">Ajustes AI del mundo</h6>
+          <div class="mb-1">
+            <label class="form-label" id="defaultAiProfileLabel">Perfil AI por defecto</label>
+            <input id="defaultAiProfileInput" class="form-control mb-1" placeholder="e.g. storyteller" />
+            <label class="form-label" id="defaultModelOverrideLabel">Model override por defecto</label>
+            <input id="defaultModelOverrideInput" class="form-control mb-1" placeholder="optional model alias or name" />
+            <div class="mt-1"><button id="saveWorldDefaults" class="btn btn-sm btn-primary">Guardar</button> <button id="worldSettingsCancel" class="btn btn-sm btn-outline-secondary">Cancelar</button></div>
+            <div class="mt-2"><small id="worldDefaultsStatus" class="text-muted"></small></div>
+
+            <!-- World profiles management -->
+            <div id="worldProfilesContainer" class="mt-3" style="border-top:1px solid #eee;padding-top:.75rem;">
+              <h6 class="card-subtitle mb-2">World Profiles</h6>
+              <div id="worldProfilesList" class="mb-2"><small class="text-muted">-</small></div>
+              <div id="worldCreateProfileForm" class="mb-2">
+                <label class="form-label">Create Profile (id)</label>
+                <input id="newProfileId" class="form-control mb-1" placeholder="e.g. storyteller" />
+                <input id="newProfileName" class="form-control mb-1" placeholder="Display name" />
+                <input id="newProfileModel" class="form-control mb-1" placeholder="Model alias or name (optional)" />
+                <input id="newProfileDescription" class="form-control mb-1" placeholder="Description (optional)" />
+                <div class="d-flex gap-2"><button id="createProfileBtn" class="btn btn-sm btn-success">Create profile</button></div>
+              </div>
+              <div id="worldProfilesStatus" class="text-muted small"></div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Global characters modal (managed centrally) -->
+    <div id="globalCharsOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:1060;">
+      <div class="card" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:720px;max-width:95%;">
+        <div class="card-body">
+          <h5 class="card-title">Global Characters</h5>
+          <div id="globalCharsList" style="max-height:300px;overflow:auto;margin-bottom:.5rem;"></div>
+          <hr/>
+          <h6>Create Global Character</h6>
+          <input id="globalCharId" class="form-control mb-1" placeholder="id (unique)" />
+          <input id="globalCharName" class="form-control mb-1" placeholder="display name" />
+          <input id="globalCharDesc" class="form-control mb-1" placeholder="description (optional)" />
+          <textarea id="globalCharMeta" class="form-control mb-1" placeholder='meta JSON (optional, e.g. {"accent":"British"})' rows="3"></textarea>
+          <div class="text-end"><button id="createGlobalCharBtn" class="btn btn-sm btn-success">Create</button> <button id="closeGlobalCharsBtn" class="btn btn-sm btn-secondary">Close</button></div>
+        </div>
+      </div>
+    </div>
+
     <!-- Log viewer: minimal timelapse/log playback for events -->
-    <div id="logViewer" style="display:none;margin-top:1rem;border:1px solid #eee;padding:.5rem;border-radius:4px;background:#fff;">
+      <div id="logViewer" style="display:none;margin-top:1rem;border:1px solid #eee;padding:.5rem;border-radius:4px;background:#fff;">
       <div class="d-flex align-items-center mb-2">
+        <div class="btn-group me-2" role="group" aria-label="Log Tabs">
+          <button id="logTabTimeline" class="btn btn-sm btn-outline-secondary active">Timeline</button>
+          <button id="logTabDebug" class="btn btn-sm btn-outline-secondary">Debug</button>
+        </div>
         <label class="me-2" for="logFilter">Filter</label>
         <select id="logFilter" class="form-select form-select-sm me-2" style="width:auto;">
           <option value="">All</option>
           <option value="ai_response">AI Response</option>
           <option value="character_memory">Character Memory</option>
-          <option value="universe_visibility_changed">Visibility</option>
+          <option value="world_visibility_changed">Visibility</option>
           <option value="owner_assigned">Owner Assigned</option>
         </select>
         <button id="playLog" class="btn btn-sm btn-outline-primary me-1">Play</button>
@@ -968,7 +1064,8 @@ body.dark pre{background:#222;color:#ddd}
         <button id="stepLog" class="btn btn-sm btn-outline-secondary me-1">Step</button>
         <input id="logSpeed" type="number" class="form-control form-control-sm" value="1000" style="width:90px;" />ms
       </div>
-      <div style="max-height:240px;overflow:auto;border-top:1px solid #eee;padding-top:.5rem;"><ul id="logList" class="list-unstyled mb-0"><li class="text-muted">- no logs -</li></ul></div>
+      <div id="logTimelinePane" style="max-height:240px;overflow:auto;border-top:1px solid #eee;padding-top:.5rem;"><ul id="logList" class="list-unstyled mb-0"><li class="text-muted">- no logs -</li></ul></div>
+      <div id="debugPane" style="display:none;max-height:240px;overflow:auto;border-top:1px solid #eee;padding-top:.5rem;background:#f8f8f8;"><ul id="debugList" class="list-unstyled mb-0"><li class="text-muted">- no debug -</li></ul></div>
     </div>
     <div id="visibilityContainer" class="mb-2" style="display:none">
       <div class="form-check">
@@ -1033,7 +1130,7 @@ body.dark pre{background:#222;color:#ddd}
 
     </div>
     <hr/>
-    <div class="mb-2">
+      <div class="mb-2">
       <label id="aiKeyLabel" class="form-label">Your AI Key (private)</label>
       <select id="userProvider" class="form-select mb-1"><option value="openai">OpenAI</option></select>
       <input id="userApiKey" class="form-control mb-1" placeholder="sk-..." />
@@ -1041,6 +1138,7 @@ body.dark pre{background:#222;color:#ddd}
       <div class="mt-2"><button id="saveUserKey" class="btn btn-sm btn-success">Save key</button></div>
       <div class="mt-2"><small id="userKeyStatus" class="text-muted"></small></div>
     </div>
+    
     <div class="mb-2">
       <label id="langLabel" class="form-label">Idioma</label>
       <select id="langSelect" class="form-select mb-1"><option value="es">Español</option><option value="en">English</option></select>
@@ -1055,13 +1153,13 @@ body.dark pre{background:#222;color:#ddd}
 
 <!-- Character detail modal (simple overlay, no bootstrap JS) -->
 <div id="charModalOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:1060;">
-  <div id="charModal" class="card" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:520px;max-width:95%;">
+      <div id="charModal" class="card" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:520px;max-width:95%;">
     <div class="card-body">
       <h5 id="charModalTitle" class="card-title">Character</h5>
       <div id="charModalBody"></div>
       <hr/>
       <div id="charEvents"></div>
-      <div class="mt-2 text-end"><button id="charModalClose" class="btn btn-sm btn-secondary me-2">Close</button><button id="charModalEdit" class="btn btn-sm btn-primary">Edit</button></div>
+      <div class="mt-2 text-end"><button id="charModalClose" class="btn btn-sm btn-secondary me-2">Close</button><button id="charModalEdit" class="btn btn-sm btn-primary">Edit</button> <button id="charModalDelete" class="btn btn-sm btn-danger ms-2">Delete</button></div>
     </div>
   </div>
 </div>
@@ -1072,6 +1170,9 @@ async function api(path, opts){
   const headers = Object.assign({}, opts.headers || {});
   const token = localStorage.getItem('wc_jwt');
   if (token) headers['authorization'] = 'Bearer ' + token;
+  // Propagate client language preference to the server so it can instruct
+  // the AI provider to respond in the user's language by default.
+  try { const lang = localStorage.getItem('wc_lang'); if (lang) headers['x-wc-lang'] = String(lang); } catch(e) {}
   const res = await fetch(path, Object.assign({}, opts, { headers }));
   return res;
 }
@@ -1079,18 +1180,18 @@ async function api(path, opts){
 // Simple client-side i18n dictionary (ES/EN) and helper. Keys are small
 // and intentionally minimal for the /play UI. Use t(key, vars) to obtain
 // a translated string; vars is an optional object for {placeholders}.
-const I18N = {
+  const I18N = {
     es: {
     nav_brand: 'WorldCore — Play',
     load: 'Cargar',
-    universe_label: 'Universo',
+    universe_label: 'Mundo (World)',
     characters: 'Personajes',
     auto_refresh: 'Auto-refresh',
     timeline_title: 'Timeline (últimos eventos)',
     interact_title: 'Interactuar',
     prompt_placeholder: 'Escribe un mensaje para el personaje...',
     send: 'Enviar',
-    ai_none: '- seleccione un universo -',
+    ai_none: '- seleccione un mundo -',
     settings: 'Ajustes',
     jwt_label: 'JWT (Authorization)',
     register: 'Registrar',
@@ -1113,13 +1214,13 @@ const I18N = {
     key_saved: 'Clave guardada',
     key_saved_but_invalid: 'Clave guardada pero no válida (código: {code})',
     error_saving_key: 'Error al guardar la clave',
-    enter_universe_id: 'Introduce id de universo',
+    enter_universe_id: 'Introduce id del mundo (server/world)',
     invalid_attributes_json: 'Atributos JSON inválidos',
     created: 'Creado',
     deleted: 'Eliminado',
     cloned: 'Clonado',
     added: 'Añadido',
-    universe_character_message_required: 'Seleccione universo, personaje y escriba un mensaje',
+    universe_character_message_required: 'Seleccione mundo, personaje y escriba un mensaje',
     char_label: 'Personaje',
     not_authenticated: 'No autenticado. Guarda tu token para usar funciones personales',
     jwt_expired: 'Tu token JWT ha expirado. Genera uno nuevo o vuelve a iniciar sesión.',
@@ -1152,6 +1253,14 @@ const I18N = {
     edit: 'Editar',
     aliases: 'Apodos',
     age: 'Edad',
+    save: 'Guardar',
+    universe_ai_defaults: 'Ajustes AI del mundo',
+    no_universe_selected: 'Ningún mundo seleccionado',
+    default_ai_profile: 'Perfil AI por defecto',
+    default_model_override: 'Model override por defecto',
+    accent_label: 'Acento',
+    ai_profile_saved: 'Perfil AI guardado',
+    no_permission: 'No tienes permiso para modificar los ajustes del mundo',
     events_title: 'Eventos',
     view_event: 'Ver evento',
     edit_character: 'Editar personaje',
@@ -1169,10 +1278,10 @@ const I18N = {
     theme_light: 'Claro',
     theme_dark: 'Oscuro',
   },
-  en: {
+    en: {
     nav_brand: 'WorldCore — Play',
     load: 'Load',
-    universe_label: 'Universe',
+    universe_label: 'World',
     characters: 'Characters',
     auto_refresh: 'Auto-refresh',
     timeline_title: 'Timeline (recent events)',
@@ -1202,13 +1311,13 @@ const I18N = {
     key_saved: 'Key saved',
     key_saved_but_invalid: 'Key saved but invalid (code: {code})',
     error_saving_key: 'Error saving key',
-    enter_universe_id: 'Enter universe id',
+    enter_universe_id: 'Enter world id',
     invalid_attributes_json: 'Invalid attributes JSON',
     created: 'Created',
     deleted: 'Deleted',
     cloned: 'Cloned',
     added: 'Added',
-    universe_character_message_required: 'Universe, character and message required',
+    universe_character_message_required: 'World, character and message required',
     char_label: 'Character',
     not_authenticated: 'Not authenticated. Save your token to use personal features',
     jwt_expired: 'Your JWT token has expired. Generate a new one or sign in again.',
@@ -1241,6 +1350,14 @@ const I18N = {
     edit: 'Edit',
     aliases: 'Aliases',
     age: 'Age',
+    save: 'Save',
+    universe_ai_defaults: 'World AI Defaults',
+    no_universe_selected: 'No world selected',
+    default_ai_profile: 'Default AI Profile',
+    default_model_override: 'Default Model Override',
+    accent_label: 'Accent',
+    ai_profile_saved: 'AI profile saved',
+    no_permission: 'You do not have permission to modify world defaults',
     events_title: 'Events',
     view_event: 'View event',
     edit_character: 'Edit character',
@@ -1319,11 +1436,11 @@ function updateAiStatus(state, provider, model, message, code) {
 }
 
 // Apply translations to visible UI elements based on selected language.
-function applyTranslations() {
+  function applyTranslations() {
   try {
     const lang = localStorage.getItem('wc_lang') || 'es';
     const elNav = document.getElementById('navBrand'); if (elNav) elNav.textContent = t('nav_brand');
-    const lblUni = document.getElementById('labelUniverse'); if (lblUni) lblUni.textContent = t('universe_label');
+    const lblUni = document.getElementById('labelWorld'); if (lblUni) lblUni.textContent = t('world_label');
     const loadBtn = document.getElementById('loadBtn'); if (loadBtn) loadBtn.textContent = t('load');
     const charsH = document.getElementById('charsHeader'); if (charsH) charsH.textContent = t('characters');
     const arLbl = document.getElementById('autoRefreshLabel'); if (arLbl) arLbl.textContent = t('auto_refresh');
@@ -1345,6 +1462,11 @@ function applyTranslations() {
     const registerBtn = document.getElementById('registerBtn'); if (registerBtn) registerBtn.textContent = t('register');
     const loginBtn = document.getElementById('loginBtn'); if (loginBtn) loginBtn.textContent = t('login');
     const aiLabel = document.getElementById('aiKeyLabel'); if (aiLabel) aiLabel.textContent = t('your_ai_key');
+    const uniAiTitle = document.getElementById('worldAiDefaultsTitle'); if (uniAiTitle) uniAiTitle.textContent = t('world_ai_defaults');
+    const defaultAiProfileLabel = document.getElementById('defaultAiProfileLabel'); if (defaultAiProfileLabel) defaultAiProfileLabel.textContent = t('default_ai_profile');
+    const defaultModelOverrideLabel = document.getElementById('defaultModelOverrideLabel'); if (defaultModelOverrideLabel) defaultModelOverrideLabel.textContent = t('default_model_override');
+    // hide until permission check runs
+    const uniBlock = document.getElementById('worldAiDefaultsBlock'); if (uniBlock) uniBlock.style.display = 'none';
     const saveKeyBtn = document.getElementById('saveUserKey'); if (saveKeyBtn) saveKeyBtn.textContent = t('save_key');
     const langLabel = document.getElementById('langLabel'); if (langLabel) langLabel.textContent = t('language_label');
     const langSel = document.getElementById('langSelect'); if (langSel) langSel.value = localStorage.getItem('wc_lang') || lang;
@@ -1356,20 +1478,36 @@ function applyTranslations() {
   }
 }
 
-async function listUniverses(){ try{ const r=await api('/api/universes'); const ids = await r.json(); const sel=document.getElementById('universeSelect'); sel.innerHTML=''; for(const id of ids){ const o=document.createElement('option'); o.value=id; o.textContent=id; sel.appendChild(o);} }catch(e){console.error(e);} }
+    async function listWorlds(){
+      try{
+        const r = await api('/api/worlds');
+        const ids = await r.json();
+        const sel = document.getElementById('worldSelect');
+        if (!sel) return;
+        sel.innerHTML = '';
+        for (const id of ids) { const o = document.createElement('option'); o.value = id; o.textContent = id; sel.appendChild(o); }
+      } catch (e) { console.error(e); }
+    }
 
-// Utility to escape HTML content before inserting into the event list
-function _escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  // Utility to escape HTML content before inserting into the event list
+  function _escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-  async function loadUniverse(id) {
+  // Keep last loaded world snapshot accessible for permission checks
+  let lastWorldSnapshot = null;
+  // Cache last known owner id per loaded world to avoid transient UI hiding
+  let lastOwnerIdCache = null;
+
+  async function loadWorld(id) {
   if (!id) return;
   try {
-    const r = await api('/api/universe/' + id);
+    const r = await api('/api/world/' + id);
     if (!r.ok) {
-      document.getElementById('events').textContent = 'error al cargar universo';
+      document.getElementById('events').textContent = 'error al cargar mundo';
       return;
     }
     const u = await r.json();
+    // store snapshot for later permission checks
+    try { lastWorldSnapshot = u; lastOwnerIdCache = (u && (u.owner || (u.attributes && u.attributes.owner))) || null; } catch (e) {}
     const chars = u.characters || [];
     // Render characters as clickable items that open a details modal
     document.getElementById('chars').innerHTML = chars.map(function (c) { return '<li><a href="#" class="char-link" data-char-id="' + _escapeHtml(c.id) + '">' + _escapeHtml(c.name) + ' (' + _escapeHtml(c.id) + ')</a>' + (c.description ? ': ' + _escapeHtml(c.description) : '') + '</li>'; }).join('');
@@ -1421,35 +1559,44 @@ function _escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&l
         const visContainer = document.getElementById('visibilityContainer');
         if (!visContainer) return;
         if (!currentUserId) { visContainer.style.display='none'; return; }
-        if (u.owner && (u.owner === currentUserId || (u.members||[]).some(function(m){return m.userId===currentUserId;}))) {
+        // Determine owner id from snapshot; fall back to cached owner to avoid transient hide
+        const ownerIdFromSnap = (u && ((u.owner) || (u.attributes && u.attributes.owner))) || null;
+        const effectiveOwner = ownerIdFromSnap || lastOwnerIdCache || null;
+        if (effectiveOwner && (effectiveOwner === currentUserId || (u.members||[]).some(function(m){return m.userId===currentUserId;}))) {
           visContainer.style.display='block';
           const chk = document.getElementById('publicToggle');
-            if (chk) {
-              try { chk.checked = !!(u.attributes && u.attributes.public); } catch(e) {}
-              chk.onchange = async function(){
-                try {
-                  const res = await api('/api/universe/'+id+'/visibility', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ public: chk.checked }) });
-                    if (!res.ok) { showAlert('danger', t('failed_update_visibility')); } else { await loadUniverse(id); }
+              if (chk) {
+                try { chk.checked = !!(u.attributes && u.attributes.public); } catch(e) {}
+                chk.onchange = async function(){
+                  try {
+               const res = await api('/api/world/'+id+'/visibility', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ public: chk.checked }) });
+                    if (!res.ok) { showAlert('danger', t('failed_update_visibility')); } else { await loadWorld(id); }
                   } catch(e){ console.error(e); showAlert('danger', t('error_update_visibility')); }
-              };
-            }
+                };
+              }
         } else { visContainer.style.display='none'; }
-      } catch(e){ console.error(e); }
+        } catch(e){ console.error(e); }
     })();
+
+    // After rendering the world snapshot and visibility, refresh world AI defaults UI
+    try { await refreshWorldAiProfileFields(); } catch (e) { /* ignore */ }
   } catch (e) { console.error(e); document.getElementById('events').textContent = 'error'; }
 }
   // Log viewer support: load events, render and play back
   let logEvents = [];
   let logIndex = -1;
   let logTimer = null;
+  // Limit number of log entries rendered to avoid client-side jank
+  let logDisplayLimit = 200;
 
   async function loadLogEvents() {
     try {
-      const id = document.getElementById('universeSelect').value;
+      const id = document.getElementById('worldSelect').value;
       if (!id) return;
-      const r = await api('/api/universe/' + id);
+    const r = await api('/api/world/' + id);
       if (!r.ok) { document.getElementById('logList').innerHTML = '<li class="text-muted">' + t('no_logs') + '</li>'; return; }
       const u = await r.json();
+      // keep the full array in memory but render only a window (most recent entries)
       logEvents = (u.events || []).slice().reverse();
       renderLogList();
     } catch (e) { console.error(e); }
@@ -1461,9 +1608,28 @@ function _escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&l
     if (!listEl) return;
     const filtered = logEvents.filter(function(ev){ if (!fl) return true; return String(ev.type) === fl; });
     if (!filtered.length) { listEl.innerHTML = '<li class="text-muted">' + t('no_logs') + '</li>'; return; }
-    listEl.innerHTML = filtered.map(function(ev, idx){ try { return '<li data-evid="'+_escapeHtml(ev.id)+'" data-idx="'+idx+'">['+_escapeHtml(ev.timestamp||'')+'] <strong>'+_escapeHtml(ev.type)+'</strong>: '+_escapeHtml(JSON.stringify(ev.payload).slice(0,200))+'</li>'; } catch(e){ return '<li>' + _escapeHtml(JSON.stringify(ev)) + '</li>'; } }).join('');
+    const toShow = filtered.slice(0, logDisplayLimit);
+    listEl.innerHTML = toShow.map(function(ev, idx){ try { return '<li data-evid="'+_escapeHtml(ev.id)+'" data-idx="'+idx+'">['+_escapeHtml(ev.timestamp||'')+'] <strong>'+_escapeHtml(ev.type)+'</strong>: '+_escapeHtml(JSON.stringify(ev.payload).slice(0,200))+'</li>'; } catch(e){ return '<li>' + _escapeHtml(JSON.stringify(ev)) + '</li>'; } }).join('');
+    // If there are more entries available, show a Load more button
+    const moreBtnId = 'logLoadMoreBtn';
+    try {
+      let moreBtn = document.getElementById(moreBtnId);
+      if (filtered.length > toShow.length) {
+        if (!moreBtn) {
+          moreBtn = document.createElement('button');
+          moreBtn.id = moreBtnId;
+          moreBtn.className = 'btn btn-sm btn-outline-secondary mt-2';
+          moreBtn.textContent = 'Load more...';
+          listEl.parentNode.appendChild(moreBtn);
+        }
+        moreBtn.style.display = 'inline-block';
+        moreBtn.onclick = function(){ logDisplayLimit = Math.min(logDisplayLimit + 200, filtered.length); renderLogList(); };
+      } else {
+        if (moreBtn) moreBtn.style.display = 'none';
+      }
+    } catch (e) { /* ignore DOM append errors */ }
     // click to view event details
-    listEl.querySelectorAll('li[data-evid]').forEach(function(li){ li.addEventListener('click', async function(){ const evId = this.getAttribute('data-evid'); try { const id = document.getElementById('universeSelect').value; const er = await api('/api/universe/' + id + '/event/' + encodeURIComponent(evId)); if (!er.ok) { showAlert('danger', t('error_generic')); return; } const evJ = await er.json(); showAlert('info', JSON.stringify(evJ, null, 2), 10000); } catch(e){ console.error(e); showAlert('danger', t('error_generic')); } }); });
+    listEl.querySelectorAll('li[data-evid]').forEach(function(li){ li.addEventListener('click', async function(){ const evId = this.getAttribute('data-evid'); try { const id = document.getElementById('worldSelect').value; const er = await api('/api/world/' + id + '/event/' + encodeURIComponent(evId)); if (!er.ok) { showAlert('danger', t('error_generic')); return; } const evJ = await er.json(); showAlert('info', JSON.stringify(evJ, null, 2), 10000); } catch(e){ console.error(e); showAlert('danger', t('error_generic')); } }); });
   }
 
   function stepLog() {
@@ -1489,15 +1655,68 @@ function _escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&l
   function pauseLog() { if (logTimer) { clearInterval(logTimer); logTimer = null; } }
 
   document.getElementById('openLogViewer').addEventListener('click', ()=>{ const p = document.getElementById('logViewer'); if (!p) return; p.style.display = p.style.display === 'none' ? 'block' : 'none'; if (p.style.display === 'block') loadLogEvents(); });
+  // Tabs for log viewer: Timeline vs Debug
+  document.getElementById('logTabTimeline')?.addEventListener('click', async ()=>{ try { document.getElementById('logTabTimeline').classList.add('active'); document.getElementById('logTabDebug').classList.remove('active'); document.getElementById('logTimelinePane').style.display='block'; document.getElementById('debugPane').style.display='none'; await loadLogEvents(); } catch(e){} });
+  document.getElementById('logTabDebug')?.addEventListener('click', async ()=>{ try { document.getElementById('logTabDebug').classList.add('active'); document.getElementById('logTabTimeline').classList.remove('active'); document.getElementById('logTimelinePane').style.display='none'; document.getElementById('debugPane').style.display='block'; await loadDebugPrompts(); } catch(e){} });
+
+  async function loadDebugPrompts(){
+    try{
+      const id = document.getElementById('worldSelect').value;
+      if (!id) return;
+      const r = await api('/api/world/' + id);
+      if (!r.ok) { document.getElementById('debugList').innerHTML = '<li class="text-muted">' + t('no_logs') + '</li>'; return; }
+      const u = await r.json();
+      const events = (u.events || []).slice().reverse();
+      const aiEv = events.filter(function(ev){ return String(ev.type) === 'ai_response'; });
+      if (!aiEv.length) { document.getElementById('debugList').innerHTML = '<li class="text-muted">' + t('no_logs') + '</li>'; return; }
+      const items = aiEv.map(function(ev){
+        try{
+          const ts = _escapeHtml(String(ev.timestamp || ''));
+          const actor = _escapeHtml(String((ev.payload && ev.payload.actorId) || 'AI'));
+          // try to get resolved model metadata from provider raw
+          const raw = (ev.payload && (ev.payload.raw || ev.payload.raw)) || {};
+          const meta = raw && raw.__wc_meta ? raw.__wc_meta : { resolvedModel: raw.model || (raw?.model || null), resolvedProfile: (ev.payload && ev.payload.profile) || null };
+          const model = _escapeHtml(String(meta && meta.resolvedModel ? meta.resolvedModel : '-'));
+          const profile = _escapeHtml(String(meta && meta.resolvedProfile ? meta.resolvedProfile : '-'));
+          const promptPreview = _escapeHtml(String((ev.payload && (ev.payload.prompt || (ev.payload.raw && ev.payload.raw.prompt))) || '').slice(0, 1000));
+          return '<li><div><small class="text-muted">[' + ts + '] model: ' + model + ' profile: ' + profile + ' actor: ' + actor + '</small></div><pre style="background:#000;color:#0f0;padding:.5rem;white-space:pre-wrap;">' + promptPreview + '</pre></li>';
+        }catch(e){ return '<li>' + _escapeHtml(JSON.stringify(ev).slice(0,200)) + '</li>'; }
+      }).join('');
+      document.getElementById('debugList').innerHTML = items;
+    }catch(e){ console.error(e); document.getElementById('debugList').innerHTML = '<li class="text-muted">' + t('no_logs') + '</li>'; }
+  }
   document.getElementById('playLog').addEventListener('click', ()=>{ playLog(); });
   document.getElementById('pauseLog').addEventListener('click', ()=>{ pauseLog(); });
   document.getElementById('stepLog').addEventListener('click', ()=>{ stepLog(); });
   document.getElementById('logFilter').addEventListener('change', ()=>{ renderLogList(); });
 
-  document.getElementById('loadBtn').addEventListener('click', ()=>{ const id=document.getElementById('universeSelect').value; loadUniverse(id); });
-  async function openCharacterModal(universeId, charId) {
+  document.getElementById('loadBtn').addEventListener('click', ()=>{ const id=document.getElementById('worldSelect').value; loadWorld(id); });
+  // Create character button in sidebar
+  try {
+    const createCharBtn = document.getElementById('createCharBtn');
+    if (createCharBtn) createCharBtn.addEventListener('click', async function(){
+      try {
+        const id = document.getElementById('worldSelect').value;
+        if (!id) { showAlert('warning', t('enter_world_id')); return; }
+        const cid = String((document.getElementById('newCharId') || {}).value || '').trim();
+        const cname = String((document.getElementById('newCharName') || {}).value || '').trim();
+        const cdesc = String((document.getElementById('newCharDesc') || {}).value || '').trim();
+        if (!cid || !cname) { showAlert('warning', 'id and name required'); return; }
+        const body = { id: cid, name: cname, description: cdesc || null };
+        const r = await api('/api/world/' + id + '/character', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+        if (!r.ok) { const j = await r.json().catch(()=>({})); showAlert('danger', t('error_generic') + ': ' + (j.error || j.code || r.status)); return; }
+        showAlert('success', t('created'));
+        (document.getElementById('newCharId') || {}).value = '';
+        (document.getElementById('newCharName') || {}).value = '';
+        (document.getElementById('newCharDesc') || {}).value = '';
+        await listWorlds();
+        await loadWorld(id);
+      } catch (e) { console.error(e); showAlert('danger', t('error_generic')); }
+    });
+  } catch (e) {}
+  async function openCharacterModal(worldId, charId) {
     try {
-      const res = await api('/api/universe/' + universeId + '/character/' + encodeURIComponent(charId));
+      const res = await api('/api/world/' + worldId + '/character/' + encodeURIComponent(charId));
       if (!res.ok) { showAlert('danger', t('error_generic')); return; }
       const ch = await res.json();
       document.getElementById('charModalTitle').textContent = (ch.name || ch.id || '') + ' (' + charId + ')';
@@ -1510,12 +1729,41 @@ function _escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&l
       } catch (e) {}
       bodyEl.innerHTML += '<p>' + _escapeHtml(ch.description || '') + '</p>';
 
+      // AI profile assignment: show a select populated with world profiles
+      try {
+        const currentProfile = (ch.meta && ch.meta.aiProfile) ? ch.meta.aiProfile : '';
+        const currentModelOverride = (ch.meta && ch.meta.modelOverride) ? ch.meta.modelOverride : '';
+        bodyEl.innerHTML += '<hr/>';
+        bodyEl.innerHTML += '<div class="mb-2"><label class="form-label">' + t('default_ai_profile') + '</label><select id="charAiProfileSelect" class="form-select mb-1"><option value="">- none -</option></select></div>';
+        bodyEl.innerHTML += '<div class="mb-2"><label class="form-label">' + t('default_model_override') + '</label><input id="charModelOverride" class="form-control mb-1" value="' + _escapeHtml(currentModelOverride) + '" placeholder="optional model alias or name" /></div>';
+        // character language and accent (meta)
+        try {
+          const currentLang = (ch.meta && ch.meta.language) ? ch.meta.language : '';
+          const currentAccent = (ch.meta && ch.meta.accent) ? ch.meta.accent : '';
+          bodyEl.innerHTML += '<div class="mb-2"><label class="form-label">' + t('language_label') + '</label><select id="charLanguageSelect" class="form-select mb-1"><option value="">(default)</option><option value="es"' + (currentLang==='es' ? ' selected' : '') + '>Español</option><option value="en"' + (currentLang==='en' ? ' selected' : '') + '>English</option></select></div>';
+          bodyEl.innerHTML += '<div class="mb-2"><label class="form-label">' + t('accent_label') + '</label><input id="charAccentInput" class="form-control mb-1" value="' + _escapeHtml(currentAccent) + '" placeholder="e.g. British, Mexican" /></div>';
+        } catch (e) {}
+        bodyEl.innerHTML += '<div class="text-end"><button id="saveCharAi" class="btn btn-sm btn-primary">' + t('save') + ' ' + t('edit_character') + '</button> <button id="saveCharMeta" class="btn btn-sm btn-outline-primary ms-2">Save meta</button></div>';
+        // populate profile select from world profiles
+        (async function(){
+          try{
+            const r = await api('/api/world/' + worldId + '/profiles');
+            if (!r.ok) return;
+            const j = await r.json();
+            const sel = document.getElementById('charAiProfileSelect');
+            if (!sel) return;
+            sel.innerHTML = '<option value="">- none -</option>' + (Array.isArray(j.profiles) ? j.profiles.map(function(p){ return '<option value="'+_escapeHtml(String(p.id))+'">'+_escapeHtml(String(p.name || p.id))+' '+(_escapeHtml(String(p.model || '')))+'</option>'; }).join('') : '');
+            try { if (currentProfile) sel.value = currentProfile; } catch(e){}
+          }catch(e){ console.error(e); }
+        })();
+      } catch (e) { console.error(e); }
+
       const eventsContainer = document.getElementById('charEvents');
       let page = 0;
       const limit = 3;
       async function loadEvents(p) {
         try {
-          const r = await api('/api/universe/' + universeId + '/character/' + encodeURIComponent(charId) + '/events?page=' + encodeURIComponent(p) + '&limit=' + limit);
+            const r = await api('/api/world/' + worldId + '/character/' + encodeURIComponent(charId) + '/events?page=' + encodeURIComponent(p) + '&limit=' + limit);
           if (!r.ok) { eventsContainer.innerHTML = '<div class="text-muted">' + t('no_events') + '</div>'; return; }
           const j = await r.json();
           if (!Array.isArray(j.events) || j.events.length === 0) { eventsContainer.innerHTML = '<div class="text-muted">' + t('no_events') + '</div>'; return; }
@@ -1526,7 +1774,7 @@ function _escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&l
           eventsContainer.innerHTML = items + '<div class="text-end"><button id="charEventsMore" class="btn btn-sm btn-outline-primary">' + t('ver_mas') + '</button></div>';
           document.getElementById('charEventsMore').addEventListener('click', function(){ page++; loadEvents(page); });
           // attach view buttons
-          eventsContainer.querySelectorAll('.view-event').forEach(function(b){ b.addEventListener('click', async function(){ const evId = this.getAttribute('data-evid'); try { const er = await api('/api/universe/' + universeId + '/event/' + encodeURIComponent(evId)); if (!er.ok) { showAlert('danger', t('error_generic')); return; } const evJ = await er.json(); showAlert('info', JSON.stringify(evJ, null, 2), 10000); } catch (e) { console.error(e); showAlert('danger', t('error_generic')); } }); });
+            eventsContainer.querySelectorAll('.view-event').forEach(function(b){ b.addEventListener('click', async function(){ const evId = this.getAttribute('data-evid'); try { const er = await api('/api/world/' + worldId + '/event/' + encodeURIComponent(evId)); if (!er.ok) { showAlert('danger', t('error_generic')); return; } const evJ = await er.json(); showAlert('info', JSON.stringify(evJ, null, 2), 10000); } catch (e) { console.error(e); showAlert('danger', t('error_generic')); } }); });
         } catch (e) { console.error(e); eventsContainer.innerHTML = '<div class="text-muted">' + t('no_events') + '</div>'; }
       }
       await loadEvents(0);
@@ -1540,15 +1788,67 @@ function _escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&l
           if (newName === null) return;
           const newDesc = prompt('New description', ch.description || '');
           const payload = { name: newName, description: newDesc };
-          const r2 = await api('/api/universe/' + universeId + '/character/' + encodeURIComponent(charId), { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+            const r2 = await api('/api/world/' + worldId + '/character/' + encodeURIComponent(charId), { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
           if (!r2.ok) { showAlert('danger', t('error_generic')); return; }
           showAlert('success', t('edit') + ' ' + (ch.name || ''));
-          // refresh universe and modal
-          await listUniverses();
-          await loadUniverse(universeId);
-          openCharacterModal(universeId, charId);
+          // refresh world and modal
+          await listWorlds();
+          await loadWorld(worldId);
+          openCharacterModal(worldId, charId);
         } catch (e) { console.error(e); showAlert('danger', t('error_generic')); }
       };
+      // Delete character handler
+      try {
+        const delBtn = document.getElementById('charModalDelete');
+        if (delBtn) delBtn.addEventListener('click', async function(){
+          try {
+            if (!confirm('Delete character ' + (ch.name || charId) + '?')) return;
+            const r = await api('/api/world/' + worldId + '/character/' + encodeURIComponent(charId), { method: 'DELETE' });
+            if (!r.ok) { const j = await r.json().catch(()=>({})); showAlert('danger', t('error_generic') + ': ' + (j.error || j.code || r.status)); return; }
+            showAlert('success', t('deleted'));
+            document.getElementById('charModalOverlay').style.display = 'none';
+            await listWorlds();
+            await loadWorld(worldId);
+          } catch (e) { console.error(e); showAlert('danger', t('error_generic')); }
+        });
+      } catch (e) {}
+      // Save AI profile for character
+      try {
+        const saveBtn = document.getElementById('saveCharAi');
+        if (saveBtn) saveBtn.addEventListener('click', async function(){
+          try {
+            const profileSelect = document.getElementById('charAiProfileSelect');
+            const profile = profileSelect ? String(profileSelect.value || '').trim() : '';
+            const modelOverride = String(document.getElementById('charModelOverride').value || '').trim();
+            const body = { profile: profile === '' ? null : profile, modelOverride: modelOverride === '' ? null : modelOverride };
+            const r = await api('/api/world/' + worldId + '/character/' + encodeURIComponent(charId) + '/ai-profile', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+            if (!r.ok) { const j = await r.json().catch(()=>({})); showAlert('danger', t('error_generic') + ': ' + (j.error || j.code || r.status)); return; }
+            showAlert('success', t('ai_profile_saved'));
+            await listWorlds();
+            await loadWorld(worldId);
+            openCharacterModal(worldId, charId);
+          } catch (e) { console.error(e); showAlert('danger', t('error_generic')); }
+        });
+        const saveMetaBtn = document.getElementById('saveCharMeta');
+        if (saveMetaBtn) saveMetaBtn.addEventListener('click', async function(){
+          try {
+            const langSel = document.getElementById('charLanguageSelect');
+            const accentEl = document.getElementById('charAccentInput');
+            const lang = langSel ? String(langSel.value || '').trim() : '';
+            const accent = accentEl ? String((accentEl.value || '')).trim() : '';
+            const meta = {};
+            if (lang) meta.language = lang; else meta.language = null;
+            if (accent) meta.accent = accent; else meta.accent = null;
+            const body = { meta };
+            const r = await api('/api/world/' + worldId + '/character/' + encodeURIComponent(charId), { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+            if (!r.ok) { const j = await r.json().catch(()=>({})); showAlert('danger', t('error_generic') + ': ' + (j.error || j.code || r.status)); return; }
+            showAlert('success', t('save'));
+            await listWorlds();
+            await loadWorld(worldId);
+            openCharacterModal(worldId, charId);
+          } catch (e) { console.error(e); showAlert('danger', t('error_generic')); }
+        });
+      } catch (e) {}
     } catch (e) { console.error(e); showAlert('danger', t('error_generic')); }
   }
   // Character click handler: open modal with details and paginated events
@@ -1559,20 +1859,50 @@ function _escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&l
       if (target.matches && target.matches('.char-link')) {
         ev.preventDefault();
         const charId = target.getAttribute('data-char-id');
-        const uniId = document.getElementById('universeSelect').value;
-        if (!uniId || !charId) return;
-        openCharacterModal(uniId, charId);
+        const worldId = document.getElementById('worldSelect').value;
+        if (!worldId || !charId) return;
+        openCharacterModal(worldId, charId);
       }
     } catch (e) { console.error(e); }
   });
-document.getElementById('send').addEventListener('click', async ()=>{ const id=document.getElementById('universeSelect').value; const cid=document.getElementById('charSelect').value; const msg=document.getElementById('prompt').value; if(!id||!cid||!msg){ showAlert('warning', t('universe_character_message_required')); return; } try{ const payload = { message: msg, actorId: cid }; const r = await api('/api/universe/'+id+'/ai',{ method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) }); const j = await r.json(); document.getElementById('aiOut').textContent = j?.text ?? JSON.stringify(j, null, 2); try{ await loadUniverse(id); }catch(e){ /* ignore refresh errors */ } }catch(e){ console.error(e); showAlert('danger', t('error_calling_ai')); } });
+  
+  // Global characters UI: load list, create and assign
+  async function loadGlobalChars() {
+    try {
+      const r = await api('/api/characters/global');
+      if (!r.ok) { showAlert('danger', 'Failed to load global characters'); return; }
+      const j = await r.json();
+      const listEl = document.getElementById('globalCharsList');
+      if (!listEl) return;
+      const chars = Array.isArray(j.characters) ? j.characters : [];
+      if (!chars.length) { listEl.innerHTML = '<div class="text-muted">- none -</div>'; return; }
+      listEl.innerHTML = chars.map(function(c){ return '<div class="d-flex align-items-start justify-content-between mb-2"><div style="flex:1"><strong>' + _escapeHtml(c.id) + '</strong> — ' + _escapeHtml(c.name || '') + '<br/><small class="text-muted">' + _escapeHtml(c.description || '') + '</small></div><div style="margin-left:8px"><div class="btn-group" role="group"><button class="btn btn-sm btn-outline-primary assignGlobalBtn" data-id="' + _escapeHtml(c.id) + '">Assign</button><button class="btn btn-sm btn-outline-secondary cloneGlobalBtn" data-id="' + _escapeHtml(c.id) + '">Clone as...</button><button class="btn btn-sm btn-outline-danger delGlobalBtn" data-id="' + _escapeHtml(c.id) + '">Delete</button></div></div></div>'; }).join('');
+      // attach handlers
+      (listEl.querySelectorAll('.assignGlobalBtn') || []).forEach(function(btn){ btn.addEventListener('click', async function(){ try{ const id = this.getAttribute('data-id'); const target = document.getElementById('worldSelect').value; if (!target) { showAlert('warning', 'Select a world first'); return; } const res = await api('/api/characters/global/' + encodeURIComponent(id) + '/assign', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ targetWorld: target }) }); if (!res.ok) { const jj = await res.json().catch(()=>({})); showAlert('danger', 'Assign failed: ' + (jj.error || jj.code || res.status)); return; } showAlert('success', 'Assigned to ' + target); await loadWorld(target); }catch(e){ console.error(e); showAlert('danger', 'Assign failed'); } }); });
+      (listEl.querySelectorAll('.cloneGlobalBtn') || []).forEach(function(btn){ btn.addEventListener('click', async function(){ try{ const id = this.getAttribute('data-id'); const newId = prompt('New local id (leave empty to reuse):', id); if (newId === null) return; const target = document.getElementById('worldSelect').value; if (!target) { showAlert('warning', 'Select a world first'); return; } const body = { targetWorld: target, newId: newId || id }; const res = await api('/api/characters/global/' + encodeURIComponent(id) + '/assign', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }); if (!res.ok) { const jj = await res.json().catch(()=>({})); showAlert('danger', 'Clone failed: ' + (jj.error || jj.code || res.status)); return; } showAlert('success', 'Cloned as ' + (newId || id)); await loadWorld(target); }catch(e){ console.error(e); showAlert('danger', 'Clone failed'); } }); });
+      (listEl.querySelectorAll('.delGlobalBtn') || []).forEach(function(btn){ btn.addEventListener('click', async function(){ try{ const id = this.getAttribute('data-id'); if (!confirm('Delete global character ' + id + '?')) return; const res = await api('/api/characters/global/' + encodeURIComponent(id), { method: 'DELETE' }); if (!res.ok) { const jj = await res.json().catch(()=>({})); showAlert('danger', 'Delete failed: ' + (jj.error || jj.code || res.status)); return; } showAlert('success', 'Deleted'); await loadGlobalChars(); }catch(e){ console.error(e); showAlert('danger', 'Delete failed'); } }); });
+    } catch (e) { console.error(e); showAlert('danger', 'Failed to load global characters'); }
+  }
+
+  // Create new global character from modal
+  try {
+    const createBtn = document.getElementById('createGlobalCharBtn');
+    if (createBtn) createBtn.addEventListener('click', async function(){ try{ const idEl = document.getElementById('globalCharId'); const nameEl = document.getElementById('globalCharName'); const descEl = document.getElementById('globalCharDesc'); const metaEl = document.getElementById('globalCharMeta'); const id = idEl ? String(idEl.value || '').trim() : ''; const name = nameEl ? String(nameEl.value || '').trim() : ''; const description = descEl ? String(descEl.value || '').trim() : ''; const metaText = metaEl ? String(metaEl.value || '').trim() : ''; if (!id || !name) { showAlert('warning', 'id and name required'); return; } let meta = undefined; if (metaText) { try { meta = JSON.parse(metaText); } catch (e) { showAlert('warning', 'Invalid meta JSON'); return; } } const body = { id, name, description: description || null, meta: meta || {} }; const res = await api('/api/characters/global', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }); if (!res.ok) { const jj = await res.json().catch(()=>({})); showAlert('danger', 'Create failed: ' + (jj.error || jj.code || res.status)); return; } showAlert('success', 'Created'); if (idEl) idEl.value=''; if (nameEl) nameEl.value=''; if (descEl) descEl.value=''; if (metaEl) metaEl.value=''; await loadGlobalChars(); }catch(e){ console.error(e); showAlert('danger', 'Create failed'); } });
+  } catch (e) {}
+
+  // Open/close handlers for global modal
+  try { const openBtn = document.getElementById('openGlobalChars'); if (openBtn) openBtn.addEventListener('click', function(){ try{ const overlay = document.getElementById('globalCharsOverlay'); if (!overlay) return; const isShown = overlay.style.display === 'block'; overlay.style.display = isShown ? 'none' : 'block'; if (!isShown) loadGlobalChars(); }catch(e){} }); const closeBtn = document.getElementById('closeGlobalCharsBtn'); if (closeBtn) closeBtn.addEventListener('click', function(){ try{ const overlay = document.getElementById('globalCharsOverlay'); if (overlay) overlay.style.display = 'none'; }catch(e){} }); } catch (e) {}
+document.getElementById('send').addEventListener('click', async ()=>{ const id=document.getElementById('worldSelect').value; const cid=document.getElementById('charSelect').value; const msg=document.getElementById('prompt').value; if(!id||!cid||!msg){ showAlert('warning', t('world_character_message_required')); return; } try{ const payload = { message: msg, actorId: cid }; const r = await api('/api/world/'+id+'/ai',{ method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload) }); const j = await r.json(); document.getElementById('aiOut').textContent = j?.text ?? JSON.stringify(j, null, 2); try{ await loadWorld(id); }catch(e){ /* ignore refresh errors */ } }catch(e){ console.error(e); showAlert('danger', t('error_calling_ai')); } });
 
   window.addEventListener('load', async ()=>{ 
     // apply translations early so UI labels render in the chosen language
     applyTranslations();
-    await listUniverses();
-    const sel = document.getElementById('universeSelect');
-    if (sel && sel.options && sel.options.length) loadUniverse(sel.value);
+    // Ensure the AI connection indicator is populated immediately on load
+    // (so the status badge left of the theme toggle is accurate on F5 / fresh open)
+    try { await refreshUserStatus(); } catch (e) { console.error('refreshUserStatus failed on load', e); }
+            await listWorlds();
+    const sel = document.getElementById('worldSelect');
+    if (sel && sel.options && sel.options.length) await loadWorld(sel.value);
     try { updateAuthUI(); } catch (e) {}
 
     // Auto-refresh: poll every 2s when enabled. Skip refresh while the
@@ -1585,8 +1915,8 @@ document.getElementById('send').addEventListener('click', async ()=>{ const id=d
           if (settingsPanel && settingsPanel.style.display === 'block') return;
           const charModal = document.getElementById('charModalOverlay');
           if (charModal && charModal.style.display === 'block') return;
-          const id = document.getElementById('universeSelect').value;
-          if (id) loadUniverse(id);
+          const id = document.getElementById('worldSelect').value;
+          if (id) loadWorld(id);
         }
       } catch (e) {
         // ignore
@@ -1596,6 +1926,165 @@ document.getElementById('send').addEventListener('click', async ()=>{ const id=d
   const theme = localStorage.getItem('wc_theme') || 'light'; if (theme === 'dark') document.body.classList.add('dark');
   document.getElementById('themeToggle').addEventListener('click', ()=>{ const t = document.body.classList.toggle('dark'); localStorage.setItem('wc_theme', t ? 'dark' : 'light'); });
   document.getElementById('openSettings').addEventListener('click', ()=>{ const p = document.getElementById('settingsPanel'); p.style.display = p.style.display === 'none' ? 'block' : 'none'; refreshUserStatus(); });
+  // Universe settings gear: open the per-world modal (do not show on global Settings)
+  try {
+    const worldBtn = document.getElementById('openWorldSettings');
+    if (worldBtn) worldBtn.addEventListener('click', ()=>{ try{ const overlay = document.getElementById('worldSettingsModalOverlay'); if(!overlay) return; const isShown = overlay.style.display === 'block'; overlay.style.display = isShown ? 'none' : 'block'; if (!isShown) refreshWorldAiProfileFields(); }catch(e){} });
+    const worldCancel = document.getElementById('worldSettingsCancel');
+    if (worldCancel) worldCancel.addEventListener('click', ()=>{ try{ const overlay = document.getElementById('worldSettingsModalOverlay'); if (overlay) overlay.style.display = 'none'; }catch(e){} });
+  } catch (e) {}
+  // When opening settings or changing selected world, refresh world AI defaults fields
+  async function refreshWorldAiProfileFields(){
+    try{
+      const id = document.getElementById('worldSelect').value;
+      const defaultAiEl = document.getElementById('defaultAiProfileInput');
+      const defaultModelEl = document.getElementById('defaultModelOverrideInput');
+      const statusEl = document.getElementById('worldDefaultsStatus');
+      const profilesListEl = document.getElementById('worldProfilesList');
+      const profilesStatusEl = document.getElementById('worldProfilesStatus');
+
+      if (!id) {
+        if (defaultAiEl) defaultAiEl.value = '';
+        if (defaultModelEl) defaultModelEl.value = '';
+        if (statusEl) statusEl.textContent = t('no_world_selected');
+        if (profilesListEl) profilesListEl.innerHTML = '';
+        if (profilesStatusEl) profilesStatusEl.textContent = '';
+        return;
+      }
+
+      // First fetch the world snapshot to check whether the current user
+      // has permission to modify world-level defaults.
+      const snapRes = await api('/api/world/' + id);
+      if (!snapRes.ok) {
+        if (statusEl) statusEl.textContent = t('error_generic');
+        const block = document.getElementById('worldAiDefaultsBlock'); if (block) block.style.display = 'none';
+        return;
+      }
+      const snap = await snapRes.json();
+      // determine current user id from UI (refreshUserStatus should have populated this)
+      const currentUser = String((document.getElementById('currentUserId') && document.getElementById('currentUserId').textContent) || '');
+      let allowed = false;
+      try {
+        if (currentUser && currentUser !== '-' && snap) {
+          if (snap.owner && snap.owner === currentUser) allowed = true;
+          if (!allowed && Array.isArray(snap.members)) {
+            for (const m of snap.members) {
+              if (m.userId === currentUser && (m.role === 'editor' || m.role === 'admin' || m.role === 'owner')) { allowed = true; break; }
+            }
+          }
+        }
+      } catch (e) { allowed = false; }
+
+      if (!allowed) {
+        // hide the block when the current user lacks permission
+        const block = document.getElementById('worldAiDefaultsBlock'); if (block) block.style.display = 'none';
+        if (statusEl) statusEl.textContent = t('no_permission');
+        return;
+      }
+
+      // user is allowed: show block and fetch the current defaults
+      const block = document.getElementById('worldAiDefaultsBlock'); if (block) block.style.display = 'block';
+      const r = await api('/api/world/' + id + '/ai-profile');
+      if (!r.ok) { if (statusEl) statusEl.textContent = t('error_generic'); return; }
+      const j = await r.json();
+      if (defaultAiEl) defaultAiEl.value = j.defaultAiProfile || '';
+      if (defaultModelEl) defaultModelEl.value = j.defaultModelOverride || '';
+      if (statusEl) statusEl.textContent = '';
+
+      // Attach saveWorldDefaults handler (clone to avoid duplicate listeners)
+      try {
+        const saveBtn = document.getElementById('saveWorldDefaults');
+        if (saveBtn) {
+          const newSave = saveBtn.cloneNode(true);
+          saveBtn.parentNode.replaceChild(newSave, saveBtn);
+              newSave.addEventListener('click', async ()=>{
+            try{
+              const profile = String((document.getElementById('defaultAiProfileInput') || {}).value || '').trim();
+              const modelOverride = String((document.getElementById('defaultModelOverrideInput') || {}).value || '').trim();
+              const body = { defaultAiProfile: profile === '' ? null : profile, defaultModelOverride: modelOverride === '' ? null : modelOverride };
+              const rr = await api('/api/world/' + id + '/ai-profile', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+              if (!rr.ok) { const jj = await rr.json().catch(()=>({})); showAlert('danger', t('error_generic') + ': ' + (jj.error || jj.code || rr.status)); return; }
+              showAlert('success', t('ai_profile_saved'));
+              try { const overlay = document.getElementById('worldSettingsModalOverlay'); if (overlay) overlay.style.display = 'none'; } catch(e) {}
+              await listWorlds();
+              await loadWorld(id);
+              await refreshWorldAiProfileFields();
+            }catch(e){ console.error(e); showAlert('danger', t('error_generic')); }
+          });
+        }
+      } catch (e) {}
+
+      // Load and render world profiles
+      try {
+        if (profilesListEl) profilesListEl.innerHTML = '<small class="text-muted">Loading...</small>';
+        if (profilesStatusEl) profilesStatusEl.textContent = '';
+        const rp = await api('/api/world/' + id + '/profiles');
+        if (!rp.ok) { if (profilesStatusEl) profilesStatusEl.textContent = t('error_generic'); if (profilesListEl) profilesListEl.innerHTML = ''; return; }
+        const pj = await rp.json();
+        const profiles = Array.isArray(pj.profiles) ? pj.profiles : [];
+        if (!profiles.length) {
+          if (profilesListEl) profilesListEl.innerHTML = '<div class="text-muted">- no profiles -</div>';
+        } else {
+          const items = profiles.map(function(p){
+            const pid = p.profileId || p.id || '';
+            const name = p.name || pid;
+            const model = p.model || '-';
+            const desc = p.description ? (' - ' + p.description) : '';
+            return '<div class="d-flex align-items-center justify-content-between mb-1"><div><strong>' + _escapeHtml(name) + '</strong> <small>(' + _escapeHtml(pid) + ')</small> <small class="text-muted">model: ' + _escapeHtml(model) + '</small>' + _escapeHtml(desc) + '</div><div><button class="btn btn-sm btn-outline-danger deleteProfileBtn" data-profile-id="' + _escapeHtml(pid) + '">Delete</button></div></div>';
+          }).join('');
+          if (profilesListEl) profilesListEl.innerHTML = items;
+          // attach delete handlers
+          try {
+            const delBtns = profilesListEl.querySelectorAll('.deleteProfileBtn');
+            delBtns.forEach(function(btn){
+              btn.addEventListener('click', async function(ev){
+                try {
+                  ev.preventDefault();
+                  const pid = this.getAttribute('data-profile-id');
+                  if (!pid) return;
+                  if (!confirm('Delete profile ' + pid + '?')) return;
+                  const dr = await api('/api/world/' + id + '/profiles/' + encodeURIComponent(pid), { method: 'DELETE' });
+                  if (!dr.ok) { const jj = await dr.json().catch(()=>({})); showAlert('danger', t('error_generic') + ': ' + (jj.error || jj.code || dr.status)); return; }
+                  showAlert('success', t('deleted'));
+                  await refreshUniverseAiProfileFields();
+                } catch (e) { console.error(e); showAlert('danger', t('error_generic')); }
+              });
+            });
+          } catch (e) {}
+        }
+        // Create profile handler (ensure not attached multiple times)
+        try {
+          const createBtn = document.getElementById('createProfileBtn');
+          if (createBtn && !createBtn.dataset.wcInit) {
+            createBtn.addEventListener('click', async function(){
+              try {
+                const pidEl = document.getElementById('newProfileId');
+                const pnameEl = document.getElementById('newProfileName');
+                const pmodelEl = document.getElementById('newProfileModel');
+                const pdescEl = document.getElementById('newProfileDescription');
+                const pid = pidEl ? String(pidEl.value || '').trim() : '';
+                const pname = pnameEl ? String(pnameEl.value || '').trim() : '';
+                const pmodel = pmodelEl ? String(pmodelEl.value || '').trim() : '';
+                const pdesc = pdescEl ? String(pdescEl.value || '').trim() : '';
+                if (!pid || !pname) { showAlert('warning', 'Profile id and name required'); return; }
+                const body = { id: pid, name: pname };
+                if (pmodel) body.model = pmodel;
+                if (pdesc) body.description = pdesc;
+                const cr = await api('/api/world/' + id + '/profiles', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+                if (!cr.ok) { const jj = await cr.json().catch(()=>({})); showAlert('danger', t('error_generic') + ': ' + (jj.error || jj.code || cr.status)); return; }
+                showAlert('success', t('created'));
+                if (pidEl) pidEl.value = ''; if (pnameEl) pnameEl.value = ''; if (pmodelEl) pmodelEl.value = ''; if (pdescEl) pdescEl.value = '';
+                await refreshUniverseAiProfileFields();
+              } catch (e) { console.error(e); showAlert('danger', t('error_generic')); }
+            });
+            createBtn.dataset.wcInit = '1';
+          }
+        } catch (e) {}
+      } catch (e) { console.error(e); if (profilesStatusEl) profilesStatusEl.textContent = t('error_generic'); }
+    }catch(e){ console.error(e); try{ document.getElementById('worldDefaultsStatus').textContent = t('error_generic'); }catch(e){} }
+  }
+  document.getElementById('worldSelect').addEventListener('change', ()=>{ try{ refreshWorldAiProfileFields(); }catch(e){} });
+  // Profiles creation/deletion handlers are attached dynamically by refreshUniverseAiProfileFields
   document.getElementById('saveJwt').addEventListener('click', async ()=>{
     const jwtElem = document.getElementById('jwtInput');
     let v = jwtElem ? String(jwtElem.value).trim() : '';
@@ -1609,15 +2098,15 @@ document.getElementById('send').addEventListener('click', async ()=>{ const id=d
         await refreshUserStatus(); 
         // refresh universe list and currently selected universe so the UI
         // reflects permissions and content immediately without F5.
-        await listUniverses();
-        const sel = document.getElementById('universeSelect');
-        if (sel && sel.options && sel.options.length) await loadUniverse(sel.value);
+    await listWorlds();
+    const sel = document.getElementById('worldSelect');
+    if (sel && sel.options && sel.options.length) await loadWorld(sel.value);
       } catch (e) { /* ignore */ }
     } else {
       showAlert('warning', t('paste_valid_jwt'));
     }
   });
-  document.getElementById('clearJwt').addEventListener('click', async ()=>{ localStorage.removeItem('wc_jwt'); showAlert('info', t('token_cleared')); try { await refreshUserStatus(); await listUniverses(); const sel = document.getElementById('universeSelect'); if (sel && sel.options && sel.options.length) await loadUniverse(sel.value); } catch (e) {} });
+  document.getElementById('clearJwt').addEventListener('click', async ()=>{ localStorage.removeItem('wc_jwt'); showAlert('info', t('token_cleared')); try { await refreshUserStatus(); await listWorlds(); const sel = document.getElementById('worldSelect'); if (sel && sel.options && sel.options.length) await loadWorld(sel.value); } catch (e) {} });
   // Register / Login handlers in Settings
   document.getElementById('registerBtn').addEventListener('click', async ()=>{
     try {
@@ -1631,7 +2120,7 @@ document.getElementById('send').addEventListener('click', async ()=>{ const id=d
           localStorage.setItem('wc_jwt', j.token);
           if (j.refreshToken) localStorage.setItem('wc_refresh', j.refreshToken);
           showAlert('success', t('register_success'));
-          try { await refreshUserStatus(); await listUniverses(); const sel = document.getElementById('universeSelect'); if (sel && sel.options && sel.options.length) await loadUniverse(sel.value); } catch (e) {}
+          try { await refreshUserStatus(); await listWorlds(); const sel = document.getElementById('worldSelect'); if (sel && sel.options && sel.options.length) await loadWorld(sel.value); } catch (e) {}
         } else { showAlert('warning', t('register_fail')); }
       } else {
         const j = await res.json().catch(() => ({}));
@@ -1657,7 +2146,7 @@ document.getElementById('send').addEventListener('click', async ()=>{ const id=d
           localStorage.setItem('wc_jwt', j.token);
           if (j.refreshToken) localStorage.setItem('wc_refresh', j.refreshToken);
           showAlert('success', t('login_success'));
-          try { await refreshUserStatus(); await listUniverses(); const sel = document.getElementById('universeSelect'); if (sel && sel.options && sel.options.length) await loadUniverse(sel.value); } catch (e) {}
+          try { await refreshUserStatus(); await listWorlds(); const sel = document.getElementById('worldSelect'); if (sel && sel.options && sel.options.length) await loadWorld(sel.value); } catch (e) {}
         } else { showAlert('warning', t('login_fail')); }
       } else {
         const j = await res.json().catch(() => ({}));
@@ -1739,9 +2228,9 @@ document.getElementById('send').addEventListener('click', async ()=>{ const id=d
         }
         await refreshUserStatus();
         // refresh universe list and currently selected universe to reflect new permissions
-        await listUniverses();
-        const sel2 = document.getElementById('universeSelect');
-        if (sel2 && sel2.options && sel2.options.length) await loadUniverse(sel2.value);
+              await listWorlds();
+        const sel2 = document.getElementById('worldSelect');
+        if (sel2 && sel2.options && sel2.options.length) await loadWorld(sel2.value);
       } else {
         const j = await r.json().catch(() => ({}));
         const code = j?.code || 'K_UNKNOWN';
@@ -1874,25 +2363,25 @@ document.getElementById('send').addEventListener('click', async ()=>{ const id=d
 <h1>WorldCore Demo</h1>
 <p>Use the endpoints below to interact.</p>
 <ul>
-<li>GET /api/universes — list universes</li>
-<li>GET /api/universe/:id — show snapshot</li>
-<li>POST /api/universe — create universe JSON {id,name,description,attributes}</li>
-<li>POST /api/universe/:id/character — add character JSON {id,name,description}</li>
-<li>POST /api/universe/:id/clone — clone universe JSON {newId,newName,newDescription}</li>
-<li>DELETE /api/universe/:id — delete universe</li>
+  <li>GET /api/worlds — list worlds</li>
+  <li>GET /api/world/:id — show world snapshot</li>
+  <li>POST /api/world — create world JSON {id,name,description,attributes}</li>
+  <li>POST /api/world/:id/character — add character JSON {id,name,description}</li>
+  <li>POST /api/world/:id/clone — clone world JSON {newId,newName,newDescription}</li>
+  <li>DELETE /api/world/:id — delete world</li>
 <li>POST /api/ai — {"prompt":"..."}</li>
 <li>CLI alternative: use <code>npm run cli -- &lt;command&gt;</code></li>
 </ul>
 <script>
 async function api(path, opts){ const r=await fetch(path,opts); return r.json(); }
-async function list(){document.getElementById('out').textContent=JSON.stringify(await api('/api/universes'),null,2)}
+async function list(){document.getElementById('out').textContent=JSON.stringify(await api('/api/worlds'),null,2)}
 let refreshTimer = null;
 async function show(){
   const id=document.getElementById('id').value;
   if (!id) { window.alert('enter universe id'); return; }
-  const u = await api('/api/universe/'+id);
+  const u = await api('/api/world/'+id);
   const lines = [];
-  lines.push('Universe: ' + u.name + ' (id: ' + u.id + ')');
+  lines.push('World: ' + u.name + ' (id: ' + u.id + ')');
   if (u.description) lines.push('Description: ' + u.description);
   if (u.attributes) lines.push('Attributes: ' + JSON.stringify(u.attributes));
   lines.push('\nCharacters:');
@@ -1910,10 +2399,10 @@ async function show(){
   if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
   const ar = document.getElementById('autoRefresh');
   if (ar && ar.checked) {
-    refreshTimer = setInterval(async () => { try { const u2 = await api('/api/universe/'+id); document.getElementById('out').textContent = '... refreshing ...\n' + JSON.stringify(u2, null, 2); } catch (e) { /* ignore */ } }, 3000);
+    refreshTimer = setInterval(async () => { try { const u2 = await api('/api/world/'+id); document.getElementById('out').textContent = '... refreshing ...\n' + JSON.stringify(u2, null, 2); } catch (e) { /* ignore */ } }, 3000);
   }
 }
-async function add(){const id=document.getElementById('id').value; const cid=document.getElementById('cid').value; const name=document.getElementById('cname').value; const desc=document.getElementById('cdesc').value; await api('/api/universe/'+id+'/character',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:cid,name,description:desc})}); window.alert('added');}
+async function add(){const id=document.getElementById('id').value; const cid=document.getElementById('cid').value; const name=document.getElementById('cname').value; const desc=document.getElementById('cdesc').value; await api('/api/world/'+id+'/character',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:cid,name,description:desc})}); window.alert('added');}
 async function createUniverse(){
   const id=document.getElementById('newId').value;
   const name=document.getElementById('newName').value;
@@ -1923,11 +2412,11 @@ async function createUniverse(){
   let attrs;
   try{attrs=attrsText?JSON.parse(attrsText):{};}catch(e){window.alert('invalid attributes JSON');return;}
   attrs = { ...(attrs||{}), eventPolicy: policy };
-  await api('/api/universe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id,name,description:desc,attributes:attrs})});
+  await api('/api/world',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id,name,description:desc,attributes:attrs})});
   window.alert('created');
 }
-async function deleteUniverse(){const id=document.getElementById('delId').value; await fetch('/api/universe/'+id,{method:'DELETE'}); window.alert('deleted');}
-async function cloneUniverse(){const src=document.getElementById('srcId').value; const nid=document.getElementById('cloneId').value; const nname=document.getElementById('cloneName').value; await api('/api/universe/'+src+'/clone',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({newId:nid,newName:nname})}); window.alert('cloned');}
+async function deleteUniverse(){const id=document.getElementById('delId').value; await fetch('/api/world/'+id,{method:'DELETE'}); window.alert('deleted');}
+async function cloneUniverse(){const src=document.getElementById('srcId').value; const nid=document.getElementById('cloneId').value; const nname=document.getElementById('cloneName').value; await api('/api/world/'+src+'/clone',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({newId:nid,newName:nname})}); window.alert('cloned');}
 
 async function interact(){
   const uid = document.getElementById('interactUniverse').value;
@@ -1935,7 +2424,7 @@ async function interact(){
   const msg = document.getElementById('interactMessage').value;
   if (!uid || !cid || !msg) { window.alert('universe, character and message required'); return; }
   const prompt = 'Act as ' + cid + '. ' + msg;
-  const res = await fetch('/api/universe/'+uid+'/ai', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ prompt }) });
+  const res = await api('/api/world/'+uid+'/ai', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ prompt }) });
   const j = await res.json();
   document.getElementById('interactOut').textContent = JSON.stringify(j, null, 2);
 }
@@ -1984,15 +2473,15 @@ async function interact(){
       return;
     }
 
-      if (req.method === 'GET' && path === '/api/universes') {
+      if (req.method === 'GET' && path === '/api/worlds') {
         // Filter universes: unassigned universes are public; assigned universes
         // are visible only to owner and invited members.
         const actorId = getRequesterId(req);
-        const ids = await persistence.listUniverseIds();
+        const ids = await persistence.listWorldIds();
         const visible: string[] = [];
         for (const id of ids) {
           try {
-            const u = await persistence.loadUniverse(id);
+            const u = await persistence.loadWorld(id);
             const owner = typeof u.getOwner === 'function' ? u.getOwner() : undefined;
             if (!owner) {
               visible.push(id);
@@ -2035,7 +2524,7 @@ async function interact(){
         return;
       }
 
-      if (req.method === 'POST' && path === '/api/universe') {
+    if (req.method === 'POST' && path === '/api/world') {
         const body = await jsonBody(req);
         if (!body || !body.id || !body.name) {
           res.writeHead(400, { 'content-type': 'application/json' });
@@ -2045,10 +2534,121 @@ async function interact(){
         if (!requireAuth(req, res)) return;
         // Identify requester (may be undefined when auth is not configured)
         const actorId = getRequesterId(req);
-        const u = await universeService.createUniverse(body.id, body.name, body.description, body.attributes, actorId);
+        const u = await worldService.createWorld(body.id, body.name, body.description, body.attributes, actorId);
         res.writeHead(201, { 'content-type': 'application/json' });
         res.end(JSON.stringify(u.snapshot()));
         return;
+      }
+
+      // Global characters CRUD: create/list/get/update/delete
+      const GLOBAL_CHARS_ID = '__global_chars';
+
+      if (req.method === 'GET' && path === '/api/characters/global') {
+        try {
+          const g = await persistence.loadWorld(GLOBAL_CHARS_ID);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ characters: (g && g.listCharacters && g.listCharacters()) || [] }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+      }
+
+      if (req.method === 'GET' && path?.startsWith('/api/characters/global/')) {
+        const charId = decodeURIComponent(path.replace('/api/characters/global/', ''));
+        try {
+          const g = await persistence.loadWorld(GLOBAL_CHARS_ID);
+          const ch = g && g.getCharacter ? g.getCharacter(charId) : undefined;
+          if (!ch) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); return; }
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(ch));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+      }
+
+      if (req.method === 'POST' && path === '/api/characters/global') {
+        if (!requireAuth(req, res)) return;
+        const actorId = getRequesterId(req);
+        if (!actorId || actorId === 'api-key') { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'jwt_required' })); return; }
+        try {
+          const body = await jsonBody(req);
+          if (!body || !body.id || !body.name) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'invalid body, expected {id,name,description?,meta?}' })); return; }
+          const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'global_character_created', timestamp: new Date().toISOString(), payload: { characterId: String(body.id), name: body.name, description: body.description || null, owner: actorId, meta: body.meta || {} } };
+          await persistence.persistEvent(GLOBAL_CHARS_ID, ev);
+          const events = await persistence.loadEvents(GLOBAL_CHARS_ID);
+          const { World } = await import('../../domain/world.js');
+          const updated = World.reconstructFromEvents(GLOBAL_CHARS_ID, undefined, events);
+          await persistence.saveSnapshot(updated);
+          res.writeHead(201, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, character: ev.payload }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed', message: e instanceof Error ? e.message : String(e) })); return; }
+      }
+
+      if (req.method === 'PUT' && path?.startsWith('/api/characters/global/')) {
+        if (!requireAuth(req, res)) return;
+        const actorId = getRequesterId(req);
+        if (!actorId || actorId === 'api-key') { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'jwt_required' })); return; }
+        const charId = decodeURIComponent(path.replace('/api/characters/global/', ''));
+        try {
+          const body = await jsonBody(req) || {};
+          const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'global_character_updated', timestamp: new Date().toISOString(), payload: { characterId: charId, name: typeof body.name === 'undefined' ? undefined : body.name, description: typeof body.description === 'undefined' ? undefined : body.description, meta: typeof body.meta === 'undefined' ? undefined : body.meta, actor: actorId } };
+          await persistence.persistEvent(GLOBAL_CHARS_ID, ev);
+          const events = await persistence.loadEvents(GLOBAL_CHARS_ID);
+          const { World } = await import('../../domain/world.js');
+           const updated = World.reconstructFromEvents(GLOBAL_CHARS_ID, undefined, events);
+          await persistence.saveSnapshot(updated);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+      }
+
+      if (req.method === 'DELETE' && path?.startsWith('/api/characters/global/')) {
+        if (!requireAuth(req, res)) return;
+        const actorId = getRequesterId(req);
+        if (!actorId || actorId === 'api-key') { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'jwt_required' })); return; }
+        const charId = decodeURIComponent(path.replace('/api/characters/global/', ''));
+        try {
+          const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'global_character_deleted', timestamp: new Date().toISOString(), payload: { characterId: charId, actor: actorId } };
+          await persistence.persistEvent(GLOBAL_CHARS_ID, ev);
+          const events = await persistence.loadEvents(GLOBAL_CHARS_ID);
+          const { World } = await import('../../domain/world.js');
+           const updated = World.reconstructFromEvents(GLOBAL_CHARS_ID, undefined, events);
+          await persistence.saveSnapshot(updated);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+      }
+
+      // Assign/clone a global character into a world
+      if (req.method === 'POST' && path?.startsWith('/api/characters/global/') && path.endsWith('/assign')) {
+        if (!requireAuth(req, res)) return;
+        const actorId = getRequesterId(req);
+        if (!actorId || actorId === 'api-key') { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'jwt_required' })); return; }
+        const charId = decodeURIComponent(path.replace('/api/characters/global/', '').replace('/assign', ''));
+        try {
+          const body = await jsonBody(req) || {};
+          // Require explicit targetWorld in the request body. Legacy targetUniverse is no longer supported.
+          const target = typeof body.targetWorld === 'string' ? String(body.targetWorld) : null;
+          const newId = body.newId ? String(body.newId) : charId;
+          if (!target) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'invalid body, expected { targetWorld, newId? }' })); return; }
+          const targetSnap = await persistence.loadWorld(target);
+          if (!hasModifyPermission(targetSnap, actorId)) { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'forbidden' })); return; }
+          // Load global character
+          const globalU = await persistence.loadWorld(GLOBAL_CHARS_ID);
+          const ch = globalU && globalU.getCharacter ? globalU.getCharacter(charId) : undefined;
+          if (!ch) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); return; }
+          // Persist character_added event into target universe
+          const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'character_added', timestamp: new Date().toISOString(), payload: { characterId: newId, name: ch.name, description: ch.description } };
+          await persistence.persistEvent(target, ev);
+          const events = await persistence.loadEvents(target);
+          const { World } = await import('../../domain/world.js');
+           const updated = World.reconstructFromEvents(target, undefined, events);
+          await persistence.saveSnapshot(updated);
+          res.writeHead(201, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, target: target }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed', message: e instanceof Error ? e.message : String(e) })); return; }
       }
 
       // Anchors endpoints: list, latest and create an anchor (checkpoint)
@@ -2056,8 +2656,8 @@ async function interact(){
       // will export the ledger, compute the chain checkpoint and persist an
       // Anchor record. Listing is allowed publicly; creating requires owner
       // permissions (or api-key) when auth is configured.
-      if (req.method === 'GET' && path?.startsWith('/api/universe/') && path.endsWith('/anchors/latest')) {
-        const id = path.replace('/api/universe/', '').replace('/anchors/latest', '');
+      if (req.method === 'GET' && path?.startsWith('/api/world/') && path.endsWith('/anchors/latest')) {
+        const id = path.replace('/api/world/', '').replace('/anchors/latest', '');
         try {
           const anchor = await persistence.getLatestAnchor(id);
           if (!anchor) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); return; }
@@ -2067,8 +2667,8 @@ async function interact(){
         } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
       }
 
-      if (req.method === 'GET' && path?.startsWith('/api/universe/') && path.endsWith('/anchors')) {
-        const id = path.replace('/api/universe/', '').replace('/anchors', '');
+      if (req.method === 'GET' && path?.startsWith('/api/world/') && path.endsWith('/anchors')) {
+        const id = path.replace('/api/world/', '').replace('/anchors', '');
         try {
           const anchors = await persistence.loadAnchors(id);
           res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
@@ -2077,11 +2677,314 @@ async function interact(){
         } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
       }
 
-      if (req.method === 'POST' && path?.startsWith('/api/universe/') && path.endsWith('/anchors')) {
-        const id = path.replace('/api/universe/', '').replace('/anchors', '');
+      // Owner claim / owner-status endpoints (minimal implementation)
+      if (req.method === 'POST' && path?.startsWith('/api/world/') && path.endsWith('/owner/claim')) {
+        const id = path.replace('/api/world/', '').replace('/owner/claim', '');
+        try {
+          if (!requireAuth(req, res)) return; // require auth for claiming
+          const actorId = getRequesterId(req);
+          if (!actorId || actorId === 'api-key') { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'jwt_required' })); return; }
+          const snapBefore = await persistence.loadWorld(id);
+          const currentOwner = typeof snapBefore.getOwner === 'function' ? snapBefore.getOwner() : undefined;
+          if (currentOwner) { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: false, status: 'denied', reason: 'already_owned', owner: currentOwner })); return; }
+          // Minimal behavior: assign owner immediately (promote)
+          const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'owner_assigned', timestamp: new Date().toISOString(), payload: { ownerId: actorId, members: [{ userId: actorId, role: 'owner' }] } };
+          await persistence.persistEvent(id, ev);
+          const events = await persistence.loadEvents(id);
+          const { World } = await import('../../domain/world.js');
+           const updatedU = World.reconstructFromEvents(id, undefined, events);
+          await persistence.saveSnapshot(updatedU);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, status: 'promoted', owner: actorId }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+      }
+
+      if (req.method === 'GET' && path?.startsWith('/api/world/') && path.endsWith('/owner-status')) {
+        const id = path.replace('/api/world/', '').replace('/owner-status', '');
+        try {
+          const snap = await persistence.loadWorld(id);
+          const owner = typeof snap.getOwner === 'function' ? snap.getOwner() : undefined;
+          // reservedOwner not implemented in this minimal pass
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ owner: owner || null, reservedOwner: null, candidates: [] }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+      }
+
+      // Presence endpoints: support join/leave/heartbeat and querying presence
+      if (req.method === 'POST' && path?.startsWith('/api/world/') && path.endsWith('/presence')) {
+        const id = path.replace('/api/world/', '').replace('/presence', '');
+        try {
+          const body = await jsonBody(req) || {};
+          const action = String(body.action || '').toLowerCase();
+          const providedUserId = body.userId ? String(body.userId) : undefined;
+          // Prefer authenticated identity when available
+          const actor = getRequesterId(req) || providedUserId || 'anonymous';
+          const now = Date.now();
+          const map = ensurePresenceMap(id);
+          // Helper to persist presence events (pseudonymize user for ledger)
+          async function persistPresenceEvent(type: string, payload: any) {
+            try {
+              try {
+                const { pseudonymize } = await import('../../utils/crypto.js');
+                const pseudo = actor ? pseudonymize(actor) : undefined;
+                const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type, timestamp: new Date().toISOString(), payload: Object.assign({}, payload, { requesterPseudo: pseudo }) };
+                await persistence.persistEvent(id, ev);
+              } catch (e) {
+                const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type, timestamp: new Date().toISOString(), payload };
+                await persistence.persistEvent(id, ev);
+              }
+            } catch (e) { /* log but do not fail presence update */ }
+          }
+
+          if (action === 'join') {
+            const prev = map.get(actor) || { lastSeen: now, accumulatedMs: 0 };
+            prev.joinedAt = prev.joinedAt || now;
+            prev.lastSeen = now;
+            map.set(actor, prev);
+            await persistPresenceEvent('presence_join', { userId: actor });
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true }));
+            return;
+          }
+
+          if (action === 'heartbeat') {
+            const entry = map.get(actor) || { lastSeen: now, accumulatedMs: 0 };
+            const delta = entry.lastSeen ? Math.max(0, now - entry.lastSeen) : 0;
+            entry.accumulatedMs = Number(entry.accumulatedMs || 0) + delta;
+            entry.lastSeen = now;
+            map.set(actor, entry);
+            // No ledger event for every heartbeat to avoid noise; optional sampling could persist summary
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true }));
+            return;
+          }
+
+          if (action === 'leave') {
+            const entry = map.get(actor);
+            if (entry) {
+              const delta = entry.lastSeen ? Math.max(0, now - entry.lastSeen) : 0;
+              entry.accumulatedMs = Number(entry.accumulatedMs || 0) + delta;
+              entry.lastSeen = now;
+              map.delete(actor);
+              await persistPresenceEvent('presence_leave', { userId: actor, accumulatedMs: entry.accumulatedMs });
+            }
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true }));
+            return;
+          }
+
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid action', allowed: ['join','leave','heartbeat'] }));
+          return;
+        } catch (e) {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'failed' }));
+          return;
+        }
+      }
+
+      if (req.method === 'GET' && path?.startsWith('/api/world/') && path.endsWith('/presence')) {
+        const id = path.replace('/api/world/', '').replace('/presence', '');
+        try {
+          const map = _presenceStore.get(id) || new Map();
+          const users = [];
+          for (const [uid, entry] of map.entries()) {
+            users.push({ userId: uid, lastSeen: entry.lastSeen, accumulatedMs: entry.accumulatedMs || 0, joinedAt: entry.joinedAt || null });
+          }
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ count: users.length, users }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+      }
+
+      // Character update: update name/description or meta (language/accent etc.)
+      if (req.method === 'PUT' && path?.startsWith('/api/world/') && path.includes('/character/')) {
+        const tail = path.replace('/api/world/', '');
+        const parts = tail.split('/character/');
+        const id = parts[0];
+        const charPart = parts[1] || '';
+        const charId = decodeURIComponent(String(charPart));
+
+        try {
+          if (!requireAuth(req, res)) return;
+          const actorId = getRequesterId(req);
+          const snapBefore = await persistence.loadWorld(id);
+          if (!hasModifyPermission(snapBefore, actorId)) { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'forbidden' })); return; }
+          const body = await jsonBody(req) || {};
+          // Accept { name?, description?, meta? } or shorthand { language, accent }
+          const payload: any = { characterId: charId };
+          if (typeof body.name !== 'undefined') payload.name = body.name;
+          if (typeof body.description !== 'undefined') payload.description = body.description;
+          if (body.meta && typeof body.meta === 'object') payload.meta = body.meta;
+          if (typeof body.language !== 'undefined' || typeof body.accent !== 'undefined') {
+            payload.meta = payload.meta || {};
+            if (typeof body.language !== 'undefined') payload.meta.language = body.language;
+            if (typeof body.accent !== 'undefined') payload.meta.accent = body.accent;
+          }
+          payload.actor = actorId;
+          const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'character_meta_updated', timestamp: new Date().toISOString(), payload };
+          await persistence.persistEvent(id, ev);
+          const events = await persistence.loadEvents(id);
+          const { World } = await import('../../domain/world.js');
+           const updatedU = World.reconstructFromEvents(id, undefined, events);
+          await persistence.saveSnapshot(updatedU);
+          const ch = updatedU.getCharacter(charId);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, character: ch }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+      }
+
+      // Character AI profile endpoints: get/set per-character preferred profile or model overrides
+      if (path?.startsWith('/api/world/') && path.includes('/character/') && path.endsWith('/ai-profile')) {
+        // parse universe id and character id
+        const tail = path.replace('/api/world/', '');
+        const parts = tail.split('/character/');
+        const id = parts[0];
+        const charPart = parts[1] || '';
+        const charId = decodeURIComponent(String(charPart).replace('/ai-profile', ''));
+
+        if (req.method === 'GET') {
+          try {
+            const u = await persistence.loadWorld(id);
+            const ch = u.getCharacter(charId);
+            if (!ch) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); return; }
+            const meta = (ch as any).meta || {};
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ profile: meta.aiProfile ?? null, modelOverride: meta.modelOverride ?? null }));
+            return;
+          } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+        }
+
+        if (req.method === 'POST') {
+          try {
+            if (!requireAuth(req, res)) return;
+            const actorId = getRequesterId(req);
+            const snapBefore = await persistence.loadWorld(id);
+            if (!hasModifyPermission(snapBefore, actorId)) { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'forbidden' })); return; }
+            const body = await jsonBody(req);
+            if (!body || (typeof body.profile === 'undefined' && typeof body.modelOverride === 'undefined')) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'invalid body, expected {profile?,modelOverride?}' })); return; }
+            // Create event and persist it, then reconstruct universe from
+            // events and persist an updated snapshot so the snapshot and
+            // ledger remain consistent.
+            const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'character_ai_profile_updated', timestamp: new Date().toISOString(), payload: { characterId: charId, profile: typeof body.profile === 'undefined' ? null : body.profile, modelOverride: typeof body.modelOverride === 'undefined' ? null : body.modelOverride, actor: actorId } };
+            await persistence.persistEvent(id, ev);
+            // Reconstruct universe from events so reconstruction logic applies
+            const events = await persistence.loadEvents(id);
+            const { World } = await import('../../domain/world.js');
+            const updatedU = World.reconstructFromEvents(id, undefined, events);
+            // Save snapshot based on reconstructed state
+            await persistence.saveSnapshot(updatedU);
+            const ch = updatedU.getCharacter(charId);
+            const meta = (ch as any)?.meta || {};
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, profile: meta.aiProfile ?? null, modelOverride: meta.modelOverride ?? null }));
+            return;
+          } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+        }
+      }
+
+      // Universe-level AI profile defaults: get/set defaults via API so users
+      // can configure per-world preferred profile or model override. These are
+      // stored in snapshot.attributes and emitted as events for auditability.
+      if (req.method === 'GET' && path?.startsWith('/api/world/') && path.endsWith('/ai-profile')) {
+        const id = path.replace('/api/world/', '').replace('/ai-profile', '');
+        try {
+          const u = await persistence.loadWorld(id);
+          const attrs = u.attributes || {};
+          const defaultAiProfile = Object.prototype.hasOwnProperty.call(attrs, 'defaultAiProfile') ? attrs.defaultAiProfile : null;
+          const defaultModelOverride = Object.prototype.hasOwnProperty.call(attrs, 'defaultModelOverride') ? attrs.defaultModelOverride : null;
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ defaultAiProfile, defaultModelOverride }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+      }
+
+      // World-level profiles: list
+      if (req.method === 'GET' && path?.startsWith('/api/world/') && path.endsWith('/profiles')) {
+        const id = path.replace('/api/world/', '').replace('/profiles', '');
+        try {
+          const u = await persistence.loadWorld(id);
+          const attrs = u.attributes || {};
+          const profiles = attrs.profiles && typeof attrs.profiles === 'object' ? Object.values(attrs.profiles) : [];
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ profiles }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+      }
+
+      // World-level profiles: create
+      if (req.method === 'POST' && path?.startsWith('/api/world/') && path.endsWith('/profiles')) {
+        const id = path.replace('/api/world/', '').replace('/profiles', '');
         if (!requireAuth(req, res)) return;
         const actorId = getRequesterId(req);
-        const snapBefore = await persistence.loadUniverse(id);
+        const snapBefore = await persistence.loadWorld(id);
+        if (!hasModifyPermission(snapBefore, actorId)) { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'forbidden' })); return; }
+        try {
+          const body = await jsonBody(req);
+          if (!body || !body.id || !body.name) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'invalid body, expected {id,name,model?}' })); return; }
+          const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'world_profile_created', timestamp: new Date().toISOString(), payload: { profileId: String(body.id), name: body.name, description: body.description || null, model: body.model || null, defaultTemperature: typeof body.defaultTemperature === 'undefined' ? null : body.defaultTemperature, defaultMaxTokens: typeof body.defaultMaxTokens === 'undefined' ? null : body.defaultMaxTokens, actor: actorId } };
+          await persistence.persistEvent(id, ev);
+          const events = await persistence.loadEvents(id);
+          const { World } = await import('../../domain/world.js');
+          const updatedU = World.reconstructFromEvents(id, undefined, events);
+          await persistence.saveSnapshot(updatedU);
+          res.writeHead(201, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, profile: ev.payload }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+      }
+
+      // World-level profiles: delete
+      if (req.method === 'DELETE' && path?.startsWith('/api/world/') && path.includes('/profiles/')) {
+        const id = path.replace('/api/world/', '').split('/profiles/')[0];
+        const profileId = decodeURIComponent(path.split('/profiles/')[1] || '');
+        if (!requireAuth(req, res)) return;
+        const actorId = getRequesterId(req);
+        const snapBefore = await persistence.loadWorld(id);
+        if (!hasModifyPermission(snapBefore, actorId)) { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'forbidden' })); return; }
+        try {
+          const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'world_profile_deleted', timestamp: new Date().toISOString(), payload: { profileId, actor: actorId } };
+          await persistence.persistEvent(id, ev);
+          const events = await persistence.loadEvents(id);
+          const { World } = await import('../../domain/world.js');
+          const updatedU = World.reconstructFromEvents(id, undefined, events);
+          await persistence.saveSnapshot(updatedU);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+      }
+
+      if (req.method === 'POST' && path?.startsWith('/api/world/') && path.endsWith('/ai-profile')) {
+        const id = path.replace('/api/world/', '').replace('/ai-profile', '');
+        if (!requireAuth(req, res)) return;
+        const actorId = getRequesterId(req);
+        const snapBefore = await persistence.loadWorld(id);
+        if (!hasModifyPermission(snapBefore, actorId)) { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'forbidden' })); return; }
+        try {
+          const body = await jsonBody(req);
+          if (!body || (typeof body.defaultAiProfile === 'undefined' && typeof body.defaultModelOverride === 'undefined')) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'invalid body, expected {defaultAiProfile?, defaultModelOverride?}' })); return; }
+          const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'world_ai_profile_updated', timestamp: new Date().toISOString(), payload: { defaultAiProfile: typeof body.defaultAiProfile === 'undefined' ? null : body.defaultAiProfile, defaultModelOverride: typeof body.defaultModelOverride === 'undefined' ? null : body.defaultModelOverride, actor: actorId } };
+          await persistence.persistEvent(id, ev);
+          const events = await persistence.loadEvents(id);
+          const { World } = await import('../../domain/world.js');
+          const updatedU = World.reconstructFromEvents(id, undefined, events);
+          await persistence.saveSnapshot(updatedU);
+          const attrs = updatedU.attributes || {};
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, defaultAiProfile: attrs.defaultAiProfile ?? null, defaultModelOverride: attrs.defaultModelOverride ?? null }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+      }
+
+      if (req.method === 'POST' && path?.startsWith('/api/world/') && path.endsWith('/anchors')) {
+        const id = path.replace('/api/world/', '').replace('/anchors', '');
+        if (!requireAuth(req, res)) return;
+        const actorId = getRequesterId(req);
+        const snapBefore = await persistence.loadWorld(id);
         if (!hasOwnerPermission(snapBefore, actorId)) { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'forbidden' })); return; }
         try {
           // Delegate to the export script which computes canonical NDJSON and
@@ -2101,16 +3004,18 @@ async function interact(){
         }
       }
 
-      if (req.method === 'GET' && path?.startsWith('/api/universe/')) {
-        const id = path.replace('/api/universe/', '');
-        const u = await persistence.loadUniverse(id);
+      if (req.method === 'GET' && path?.startsWith('/api/world/')) {
+        const id = path.replace('/api/world/', '');
+        const u = await persistence.loadWorld(id);
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify(u.snapshot()));
         return;
       }
 
-      if (req.method === 'POST' && path?.startsWith('/api/universe/') && path.endsWith('/character')) {
-        const id = path.replace('/api/universe/', '').replace('/character', '');
+      
+
+      if (req.method === 'POST' && path?.startsWith('/api/world/') && path.endsWith('/character')) {
+        const id = path.replace('/api/world/', '').replace('/character', '');
         const body = await jsonBody(req);
         if (!body || !body.id || !body.name) {
           res.writeHead(400, { 'content-type': 'application/json' });
@@ -2120,21 +3025,45 @@ async function interact(){
         if (!requireAuth(req, res)) return;
         // Permission check: only owners or editors may modify a universe
         const actorId = getRequesterId(req);
-        const snapBefore = await persistence.loadUniverse(id);
+        const snapBefore = await persistence.loadWorld(id);
         if (!hasModifyPermission(snapBefore, actorId)) {
           res.writeHead(403, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: 'forbidden' }));
           return;
         }
-        await universeService.addCharacter(id, { id: body.id, name: body.name, description: body.description });
-        const u = await persistence.loadUniverse(id);
+        await worldService.addCharacter(id, { id: body.id, name: body.name, description: body.description });
+        const u = await persistence.loadWorld(id);
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify(u.snapshot()));
         return;
       }
 
-      if (req.method === 'POST' && path?.startsWith('/api/universe/') && path.endsWith('/clone')) {
-        const id = path.replace('/api/universe/', '').replace('/clone', '');
+      // Delete a character from a universe
+      if (req.method === 'DELETE' && path?.startsWith('/api/world/') && path.includes('/character/')) {
+        const tail = path.replace('/api/world/', '');
+        const parts = tail.split('/character/');
+        const id = parts[0];
+        const charPart = parts[1] || '';
+        const charId = decodeURIComponent(String(charPart));
+        if (!requireAuth(req, res)) return;
+        const actorId = getRequesterId(req);
+        const snapBefore = await persistence.loadWorld(id);
+        if (!hasModifyPermission(snapBefore, actorId)) { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'forbidden' })); return; }
+        try {
+          const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'character_deleted', timestamp: new Date().toISOString(), payload: { characterId: charId, actor: actorId } };
+          await persistence.persistEvent(id, ev);
+          const events = await persistence.loadEvents(id);
+          const { World } = await import('../../domain/world.js');
+           const updatedU = World.reconstructFromEvents(id, undefined, events);
+          await persistence.saveSnapshot(updatedU);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+      }
+
+      if (req.method === 'POST' && path?.startsWith('/api/world/') && path.endsWith('/clone')) {
+        const id = path.replace('/api/world/', '').replace('/clone', '');
         const body = await jsonBody(req);
         if (!body || !body.newId) {
           res.writeHead(400, { 'content-type': 'application/json' });
@@ -2142,7 +3071,7 @@ async function interact(){
           return;
         }
         // perform clone: copy events and snapshot
-        const source = await persistence.loadUniverse(id);
+        const source = await persistence.loadWorld(id);
         // Only owners/admins may clone a universe
         if (!requireAuth(req, res)) return;
         const actorId = getRequesterId(req);
@@ -2169,18 +3098,50 @@ async function interact(){
           snap.members = [{ userId: actorOwner, role: 'owner' }];
         }
         await adapter.saveSnapshot(body.newId, snap);
-        const newU = await persistence.loadUniverse(body.newId);
+        const newU = await persistence.loadWorld(body.newId);
         res.writeHead(201, { 'content-type': 'application/json' });
         res.end(JSON.stringify(newU.snapshot()));
         return;
       }
 
-      // Visibility toggle: owner can make an assigned universe public in lists
-      if (req.method === 'POST' && path?.startsWith('/api/universe/') && path.endsWith('/visibility')) {
-        const id = path.replace('/api/universe/', '').replace('/visibility', '');
+      // Clone a character from this universe into another universe
+      if (req.method === 'POST' && path?.startsWith('/api/world/') && path.includes('/character/') && path.endsWith('/clone')) {
+        // path: /api/world/:src/character/:charId/clone
+        const tail = path.replace('/api/world/', '');
+        const parts = tail.split('/character/');
+        const srcId = parts[0];
+        const charPart = parts[1] || '';
+        const charId = decodeURIComponent(String(charPart).replace('/clone', ''));
         if (!requireAuth(req, res)) return;
         const actorId = getRequesterId(req);
-        const snap = await persistence.loadUniverse(id);
+        const srcSnap = await persistence.loadWorld(srcId);
+        // Require modify permission on target later; body must include targetWorld
+        try {
+          const body = await jsonBody(req) || {};
+          const target = typeof body.targetWorld === 'string' ? String(body.targetWorld) : null;
+          const newId = typeof body.newId === 'string' ? String(body.newId) : charId;
+          if (!target) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'invalid body, expected {targetWorld, newId?}' })); return; }
+          // Read character from source
+          const ch = srcSnap.getCharacter(charId);
+          if (!ch) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); return; }
+          // Check permission on target
+            const targetSnapBefore = await persistence.loadWorld(target);
+          if (!hasModifyPermission(targetSnapBefore, actorId)) { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'forbidden' })); return; }
+          // Use UniverseService to add character to target universe
+          await worldService.addCharacter(target, { id: newId, name: ch.name, description: ch.description });
+            const u = await persistence.loadWorld(target);
+          res.writeHead(201, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, target: u.snapshot() }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed', message: e instanceof Error ? e.message : String(e) })); return; }
+      }
+
+      // Visibility toggle: owner can make an assigned universe public in lists
+      if (req.method === 'POST' && path?.startsWith('/api/world/') && path.endsWith('/visibility')) {
+        const id = path.replace('/api/world/', '').replace('/visibility', '');
+        if (!requireAuth(req, res)) return;
+        const actorId = getRequesterId(req);
+        const snap = await persistence.loadWorld(id);
         if (!hasOwnerPermission(snap, actorId)) {
           res.writeHead(403, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: 'forbidden' }));
@@ -2197,18 +3158,18 @@ async function interact(){
           try {
             const { pseudonymize } = await import('../../utils/crypto.js');
             const pseudo = actorId ? pseudonymize(actorId) : undefined;
-            const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'universe_visibility_changed', timestamp: new Date().toISOString(), payload: { public: !!body.public, changedByPseudo: pseudo } };
+            const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'world_visibility_changed', timestamp: new Date().toISOString(), payload: { public: !!body.public, changedByPseudo: pseudo } };
             await persistence.persistEvent(id, ev);
           } catch (e) {
-            const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'universe_visibility_changed', timestamp: new Date().toISOString(), payload: { public: !!body.public } };
+            const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'world_visibility_changed', timestamp: new Date().toISOString(), payload: { public: !!body.public } };
             await persistence.persistEvent(id, ev);
           }
 
           // Update snapshot attributes
-          const updated = await persistence.loadUniverse(id);
+          const updated = await persistence.loadWorld(id);
           updated.attributes = { ...(updated.attributes || {}), public: !!body.public } as any;
           await persistence.saveSnapshot(updated);
-          const newSnap = await persistence.loadUniverse(id);
+          const newSnap = await persistence.loadWorld(id);
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(JSON.stringify(newSnap.snapshot()));
           return;
@@ -2220,11 +3181,11 @@ async function interact(){
       }
 
       // Members management: invite/update member
-      if (req.method === 'POST' && path?.startsWith('/api/universe/') && path.endsWith('/members')) {
-        const id = path.replace('/api/universe/', '').replace('/members', '');
+      if (req.method === 'POST' && path?.startsWith('/api/world/') && path.endsWith('/members')) {
+        const id = path.replace('/api/world/', '').replace('/members', '');
         if (!requireAuth(req, res)) return;
         const actorId = getRequesterId(req);
-        const snapBefore = await persistence.loadUniverse(id);
+        const snapBefore = await persistence.loadWorld(id);
         // Only owner or admin may change membership
         if (!hasOwnerPermission(snapBefore, actorId)) {
           res.writeHead(403, { 'content-type': 'application/json' });
@@ -2238,7 +3199,7 @@ async function interact(){
           return;
         }
         try {
-          const updated = await universeService.addMember(id, body.userId, body.role);
+          const updated = await worldService.addMember(id, body.userId, body.role);
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(JSON.stringify(updated.snapshot()));
           return;
@@ -2250,19 +3211,19 @@ async function interact(){
       }
 
       // Remove a member
-      if (req.method === 'DELETE' && path?.startsWith('/api/universe/') && path.includes('/members/')) {
-        const id = path.replace('/api/universe/', '').split('/members/')[0];
+      if (req.method === 'DELETE' && path?.startsWith('/api/world/') && path.includes('/members/')) {
+        const id = path.replace('/api/world/', '').split('/members/')[0];
         const userToRemove = path.split('/members/')[1];
         if (!requireAuth(req, res)) return;
         const actorId = getRequesterId(req);
-        const snapBefore = await persistence.loadUniverse(id);
+        const snapBefore = await persistence.loadWorld(id);
         if (!hasOwnerPermission(snapBefore, actorId)) {
           res.writeHead(403, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: 'forbidden' }));
           return;
         }
         try {
-          const updated = await universeService.removeMember(id, userToRemove);
+          const updated = await worldService.removeMember(id, userToRemove);
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end(JSON.stringify(updated.snapshot()));
           return;
@@ -2274,9 +3235,9 @@ async function interact(){
       }
 
       // List members of a universe (restricted for assigned universes)
-      if (req.method === 'GET' && path?.startsWith('/api/universe/') && path.endsWith('/members')) {
-        const id = path.replace('/api/universe/', '').replace('/members', '');
-        const snap = await persistence.loadUniverse(id);
+      if (req.method === 'GET' && path?.startsWith('/api/world/') && path.endsWith('/members')) {
+        const id = path.replace('/api/world/', '').replace('/members', '');
+        const snap = await persistence.loadWorld(id);
         const actorId = getRequesterId(req);
         // If universe is assigned, only owner or members can view members
         const owner = typeof snap.getOwner === 'function' ? snap.getOwner() : undefined;
@@ -2294,24 +3255,41 @@ async function interact(){
         return;
       }
 
-      if (req.method === 'DELETE' && path?.startsWith('/api/universe/')) {
+      if (req.method === 'DELETE' && path?.startsWith('/api/world/')) {
         if (!requireAuth(req, res)) return;
-        const id = path.replace('/api/universe/', '');
+        const id = path.replace('/api/world/', '');
         const actorId = getRequesterId(req);
-        const snap = await persistence.loadUniverse(id);
+        const snap = await persistence.loadWorld(id);
         if (!hasOwnerPermission(snap, actorId)) {
           res.writeHead(403, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: 'forbidden' }));
           return;
         }
-        await persistence.deleteUniverse(id);
+        await persistence.deleteWorld(id);
         res.writeHead(204);
         res.end();
         return;
       }
 
-      // User endpoints: manage per-user API keys and profile. Require JWT (not API key) for updating.
+      // User endpoints: manage per-user API keys and profile. GET /api/user is
+      // intentionally forgiving: when no auth header is present we return a
+      // minimal public view so the /play UI can render without spamming the
+      // console with 401/403 errors. If an Authorization/x-api-key header is
+      // supplied, validate it and return the authenticated user's info.
       if (req.method === 'GET' && path === '/api/user') {
+        const hasAuthHdr = Boolean(req.headers['authorization'] || req.headers['x-api-key']);
+        const globalKey = process.env.OPENAI_API_KEY || process.env.WORLDCORE_OPENAI_KEY || null;
+        const globalModel = process.env.WORLDCORE_OPENAI_MODEL || null;
+
+        if (!hasAuthHdr) {
+          // No auth provided: return minimal public-facing info (non-sensitive)
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ id: null, provider: null, hasKey: false, meta: {}, globalProviderConfigured: !!globalKey, globalProviderModel: globalModel }));
+          return;
+        }
+
+        // Auth header present: validate and return authenticated user or an
+        // error if the token/key is invalid (preserves previous behaviour).
         if (!requireAuth(req, res)) return;
         const actorId = getRequesterId(req);
         if (!actorId || actorId === 'api-key') {
@@ -2320,8 +3298,6 @@ async function interact(){
           return;
         }
         const user = await persistence.loadUser(actorId);
-        const globalKey = process.env.OPENAI_API_KEY || process.env.WORLDCORE_OPENAI_KEY || null;
-        const globalModel = process.env.WORLDCORE_OPENAI_MODEL || null;
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ id: actorId, provider: user?.provider ?? null, hasKey: Boolean(user?.apiKey), meta: user?.meta ?? {}, globalProviderConfigured: !!globalKey, globalProviderModel: globalModel }));
         return;
@@ -2435,10 +3411,10 @@ async function interact(){
           res.end(JSON.stringify({ error: 'invalid body, expected {prompt}' }));
           return;
         }
-        // If body.universeId is provided, load universe context
-          if (body.universeId) {
-            let snapU = await persistence.loadUniverse(body.universeId);
-            const events = await persistence.loadEvents(body.universeId);
+        // If body.worldId is provided, load world context
+          if (body.worldId) {
+            let snapU = await persistence.loadWorld(body.worldId);
+            const events = await persistence.loadEvents(body.worldId);
             // Auto-assign owner to first authenticated user that interacts with
             // the universe if it currently has no owner.
             try {
@@ -2451,9 +3427,9 @@ async function interact(){
                   timestamp: new Date().toISOString(),
                   payload: { ownerId: actorUser, members: [{ userId: actorUser, role: 'owner' }] },
                 };
-                await persistence.persistEvent(body.universeId, assignEv);
+                   await persistence.persistEvent(body.worldId, assignEv);
                 // materialize snapshot immediately so subsequent logic sees owner
-                const updatedU = await persistence.loadUniverse(body.universeId);
+                 const updatedU = await persistence.loadWorld(body.worldId);
                 await persistence.saveSnapshot(updatedU);
                 snapU = updatedU;
                 // reload events to include owner_assigned
@@ -2462,15 +3438,73 @@ async function interact(){
             } catch (e) {
               // Ignore owner assignment failures; continue without blocking AI call
             }
-            const ctx = buildUniverseContext(snapU.snapshot(), events);
+            const ctx = buildWorldContext(snapU.snapshot(), events);
             // Build structured messages for multi-turn chat (system + user).
             let messages = [ { role: 'system', content: ctx }, { role: 'user', content: body.prompt } ];
             // compact messages to avoid context-length errors
             messages = compactMessages(messages, 120000);
+            
             const ai = await getAiProviderForRequest(req, 'conversation');
-            logger.info('ai.request', { universe: body.universeId, promptPreview: String(body.prompt).slice(0, 300) });
-            const r = await ai.generate(body.prompt, { profile: 'conversation', messages });
-            logger.info('ai.response', { universe: body.universeId, textPreview: String(r.text).slice(0, 300) });
+            // Determine profile/modelOverride preference: per-character meta > universe attributes > default
+            let chosenProfile: any = 'conversation';
+            let modelOverride: any = undefined;
+            let actorIdFromPrompt: string | undefined = undefined;
+            try {
+              const actorUser = getRequesterId(req);
+              // If the request includes an explicit actor (detected earlier), prefer its profile
+              // Note: actor identification above used detect-by-name heuristics; here we attempt
+              // to read character meta if actorId was resolved earlier in this scope.
+              // We don't want to re-run heavy logic; use the snapU loaded above.
+              // Attempt to detect actorId from messages if available
+              try {
+                const chars = snapU.listCharacters();
+                for (const c of chars) {
+                  const name = (c.name || '').replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
+                  const re = new RegExp(`\\b${name}\\b`, 'i');
+                  if (re.test(body.prompt)) { actorIdFromPrompt = c.id; break; }
+                }
+              } catch (e) {}
+              const actorIdToUse = actorIdFromPrompt || undefined;
+              if (actorIdToUse) {
+                const ch = snapU.getCharacter(actorIdToUse as any);
+                if (ch && (ch as any).meta) {
+                  if ((ch as any).meta.aiProfile) chosenProfile = (ch as any).meta.aiProfile;
+                  if ((ch as any).meta.modelOverride) modelOverride = (ch as any).meta.modelOverride;
+                }
+              }
+              // Universe-level defaults
+              try {
+                if (!chosenProfile && snapU && snapU.attributes && snapU.attributes.defaultAiProfile) chosenProfile = snapU.attributes.defaultAiProfile;
+                if (!modelOverride && snapU && snapU.attributes && snapU.attributes.defaultModelOverride) modelOverride = snapU.attributes.defaultModelOverride;
+              } catch (e) {}
+            } catch (e) {}
+
+            // If a character was resolved from the prompt and has an accent meta,
+            // instruct the provider to simulate that accent in the response.
+            try {
+              const actorIdToUse = actorIdFromPrompt || undefined;
+              let actorCh = null;
+              if (actorIdToUse) {
+                try { actorCh = snapU.getCharacter(actorIdToUse as any); } catch (e) { actorCh = null; }
+              }
+              if (actorCh && (actorCh as any).meta && (actorCh as any).meta.accent) {
+                try { messages.splice(1, 0, { role: 'system', content: `Simulate accent/voice: ${(actorCh as any).meta.accent}` }); } catch (e) {}
+              }
+            } catch (e) {}
+
+            logger.info('ai.request', { world: body.worldId, promptPreview: String(body.prompt).slice(0, 300), profile: chosenProfile, modelOverride });
+            let r;
+            try {
+              const opts: any = { profile: chosenProfile, messages };
+              if (modelOverride) opts.modelOverride = modelOverride;
+              r = await ai.generate(body.prompt, opts);
+              } catch (err) {
+                logger.error('ai.generate_failed', { world: body.worldId, err: err instanceof Error ? err.message : String(err) });
+                res.writeHead(502, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ error: 'ai_failed', message: err instanceof Error ? err.message : String(err) }));
+                return;
+              }
+            logger.info('ai.response', { world: body.worldId, textPreview: String(r.text).slice(0, 300) });
             // persist AI response as an event in the universe ledger
             try {
               // attempt to detect an actor mentioned in the prompt
@@ -2501,7 +3535,7 @@ async function interact(){
                     timestamp: new Date().toISOString(),
                     payload: { requesterPseudo, actorId, prompt: body.prompt, response: r.text ?? null, raw: r.raw ?? r, messages },
                   };
-                await persistence.persistEvent(body.universeId, ev);
+                await persistence.persistEvent(body.worldId, ev);
               } catch (e) {
                   // fallback: persist without pseudonym (dev only)
                     const ev = {
@@ -2510,7 +3544,7 @@ async function interact(){
                     timestamp: new Date().toISOString(),
                     payload: { requesterId: getRequesterId(req), actorId, prompt: body.prompt, response: r.text ?? null, raw: r.raw ?? r, messages },
                   };
-                  await persistence.persistEvent(body.universeId, ev);
+                  await persistence.persistEvent(body.worldId, ev);
                 }
               // Also persist as character memory so snapshots materialize the reply
                 if (actorId) {
@@ -2520,8 +3554,8 @@ async function interact(){
                     timestamp: new Date().toISOString(),
                     payload: { characterId: actorId, text: r.text ?? null },
                   };
-                await persistence.persistEvent(body.universeId, memEv);
-                logger.info('ai.mem_persisted', { universe: body.universeId, characterId: actorId, eventId: memEv.id });
+                await persistence.persistEvent(body.worldId, memEv);
+                logger.info('ai.mem_persisted', { world: body.worldId, characterId: actorId, eventId: memEv.id });
                 }
             } catch (err) {
               // log but do not fail the AI response
@@ -2532,23 +3566,192 @@ async function interact(){
             return;
           }
 
+      // Ordenador command interpreter: allow privileged users to run simple
+      // NL commands that mutate the universe (create/delete/rename characters).
+      if (req.method === 'POST' && path?.startsWith('/api/world/') && path.endsWith('/ordenador/command')) {
+        const id = path.replace('/api/world/', '').replace('/ordenador/command', '');
+        if (!requireAuth(req, res)) return;
+        const actorId = getRequesterId(req);
+        if (!actorId || actorId === 'api-key') { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'jwt_required' })); return; }
+        const snapBefore = await persistence.loadWorld(id);
+        if (!hasModifyPermission(snapBefore, actorId)) { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'forbidden' })); return; }
+        try {
+          const body = await jsonBody(req) || {};
+          const message = String(body.message || '').trim();
+          if (!message) { res.writeHead(400, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'invalid body, expected {message}' })); return; }
+
+          const emitted: any[] = [];
+
+          // helpers to find character by name or id
+          function findCharByNameOrId(u: any, token: string) {
+            if (!token) return null;
+            const byId = u.getCharacter(token);
+            if (byId) return byId;
+            const lower = token.toLowerCase();
+            const chars = u.listCharacters();
+            for (const c of chars) {
+              if ((c.name || '').toLowerCase() === lower) return c;
+            }
+            return null;
+          }
+
+          // create command: create Tom / crea personaje "Tom"
+          const mCreate = message.match(/\b(?:crea(?:r)?|create)\b(?:\s+(?:personaje|person|char(?:acter)?))?\s+(?:"([^"]+)"|'([^']+)'|(\S+))/i);
+          if (mCreate) {
+            const name = mCreate[1] || mCreate[2] || mCreate[3];
+            const idForChar = (body.newId && String(body.newId).trim()) || String((name || '').replace(/\s+/g, '_')).trim();
+            if (snapBefore.getCharacter(idForChar)) { res.writeHead(409, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'character_exists' })); return; }
+            const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'character_added', timestamp: new Date().toISOString(), payload: { characterId: idForChar, name: name, description: null } };
+            await persistence.persistEvent(id, ev);
+            emitted.push(ev);
+          }
+
+          // delete command: elimina personaje Tom / delete Tom
+          const mDelete = message.match(/\b(?:elimina(?:r)?|borra|delete|remove)\b(?:\s+(?:personaje|person|char(?:acter)?))?\s+(?:"([^"]+)"|'([^']+)'|(\S+))/i);
+          if (mDelete) {
+            const token = mDelete[1] || mDelete[2] || mDelete[3];
+            const found = findCharByNameOrId(snapBefore, token);
+            if (!found) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'character_not_found' })); return; }
+            const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'character_deleted', timestamp: new Date().toISOString(), payload: { characterId: found.id, actor: actorId } };
+            await persistence.persistEvent(id, ev);
+            emitted.push(ev);
+          }
+
+          // rename command: renombra <old> a <new> / rename <old> to <new>
+          const mRename = message.match(/\b(?:renombra|rename|cambia nombre a|change name to)\b\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s+(?:a|to)\s+(?:"([^']+)"|'([^']+)'|(.+))/i);
+          if (mRename) {
+            const oldToken = mRename[1] || mRename[2] || mRename[3];
+            const newName = (mRename[4] || mRename[5] || mRename[6] || '').trim();
+            const found = findCharByNameOrId(snapBefore, oldToken);
+            if (!found) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'character_not_found' })); return; }
+            const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'character_meta_updated', timestamp: new Date().toISOString(), payload: { characterId: found.id, name: newName, actor: actorId } };
+            await persistence.persistEvent(id, ev);
+            emitted.push(ev);
+          }
+
+          // move command: move <char> from <worldA> to <worldB> (EN) or
+          // mueve <char> del <Mundo A> al <Mundo B> (ES)
+          const mMoveEn = message.match(/\b(?:move)\b\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s+from\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s+to\s+(?:"([^"]+)"|'([^']+)'|(\S+))/i);
+          const mMoveEs = message.match(/\b(?:mueve|traslada|mover)\b\s+(?:a\s*)?(?:"([^"]+)"|'([^']+)'|(\S+))\s+(?:del|de)\s+(?:Mundo\s+)?(?:"([^"]+)"|'([^']+)'|(\S+))\s+(?:al|a)\s+(?:Mundo\s+)?(?:"([^"]+)"|'([^']+)'|(\S+))/i);
+          if (mMoveEn || mMoveEs) {
+            // extract tokens
+            let charToken: string | undefined;
+            let fromToken: string | undefined;
+            let toToken: string | undefined;
+            if (mMoveEn) {
+              charToken = mMoveEn[1] || mMoveEn[2] || mMoveEn[3];
+              fromToken = mMoveEn[4] || mMoveEn[5] || mMoveEn[6];
+              toToken = mMoveEn[7] || mMoveEn[8] || mMoveEn[9];
+            } else if (mMoveEs) {
+              charToken = mMoveEs[1] || mMoveEs[2] || mMoveEs[3];
+              fromToken = mMoveEs[4] || mMoveEs[5] || mMoveEs[6];
+              toToken = mMoveEs[7] || mMoveEs[8] || mMoveEs[9];
+            }
+
+            // helper to find a universe id by name or id
+            async function findUniverseByNameOrId(token: string | undefined) {
+              if (!token) return null;
+              const lookup = String(token).toLowerCase().trim();
+              const uids = await persistence.listWorldIds();
+              for (const uid of uids) {
+                try {
+                   const snap = await persistence.loadWorld(uid);
+                  if (String(uid).toLowerCase() === lookup) return uid;
+                  if ((snap && String(snap.name || '').toLowerCase()) === lookup) return uid;
+                } catch (e) { /* ignore */ }
+              }
+              return null;
+            }
+
+            const srcId = (fromToken ? await findUniverseByNameOrId(fromToken) : id) || null;
+            const dstId = toToken ? await findUniverseByNameOrId(toToken) : null;
+            if (!srcId || !dstId) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'world_not_found', from: srcId, to: dstId })); return; }
+
+            // load universes
+             const srcSnap = await persistence.loadWorld(srcId);
+             const dstSnap = await persistence.loadWorld(dstId);
+            if (!hasModifyPermission(srcSnap, actorId) || !hasModifyPermission(dstSnap, actorId)) { res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'forbidden' })); return; }
+
+            const found = findCharByNameOrId(srcSnap, charToken || '');
+            if (!found) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'character_not_found_in_source' })); return; }
+            // conflict check
+            const existsInDst = dstSnap.getCharacter(found.id);
+            if (existsInDst) { res.writeHead(409, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'character_conflict_in_target', id: found.id })); return; }
+
+            // perform delete in source and add in target; also copy meta and memory entries
+            const evDel = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'character_deleted', timestamp: new Date().toISOString(), payload: { characterId: found.id, actor: actorId } };
+            await persistence.persistEvent(srcId, evDel);
+            emitted.push(evDel);
+
+            const evAdd = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'character_added', timestamp: new Date().toISOString(), payload: { characterId: found.id, name: found.name, description: found.description } };
+            await persistence.persistEvent(dstId, evAdd);
+            emitted.push(evAdd);
+
+            // copy meta if present
+            try {
+              if ((found as any).meta && Object.keys((found as any).meta || {}).length) {
+                const metaEv = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'character_meta_updated', timestamp: new Date().toISOString(), payload: { characterId: found.id, meta: (found as any).meta, actor: actorId } };
+                await persistence.persistEvent(dstId, metaEv);
+                emitted.push(metaEv);
+              }
+            } catch (e) {}
+
+            // copy memory entries if any
+            try {
+              const mems = (found.memory || []);
+              for (const mtext of mems) {
+                const memEv = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'character_memory', timestamp: new Date().toISOString(), payload: { characterId: found.id, text: mtext } };
+                await persistence.persistEvent(dstId, memEv);
+                emitted.push(memEv);
+              }
+            } catch (e) {}
+
+            // rebuild snapshots for both universes
+            try {
+              const { World } = await import('../../domain/world.js');
+              const srcEvents = await persistence.loadEvents(srcId);
+              const srcUpdated = World.reconstructFromEvents(srcId, undefined, srcEvents);
+              await persistence.saveSnapshot(srcUpdated);
+              const dstEvents = await persistence.loadEvents(dstId);
+              const dstUpdated = World.reconstructFromEvents(dstId, undefined, dstEvents);
+              await persistence.saveSnapshot(dstUpdated);
+            } catch (e) {}
+          }
+
+          if (!emitted.length) {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ error: 'unknown_command', message: 'No supported command detected' }));
+            return;
+          }
+
+          // Rebuild snapshot and return result
+          const events = await persistence.loadEvents(id);
+          const { World } = await import('../../domain/world.js');
+          const updatedU = World.reconstructFromEvents(id, undefined, events);
+          await persistence.saveSnapshot(updatedU);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, emitted: emitted.map(e => ({ id: e.id, type: e.type, payload: e.payload })), snapshot: updatedU.snapshot() }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed', message: e instanceof Error ? e.message : String(e) })); return; }
+      }
+
         // Automatic disambiguation: if the prompt mentions a character name
         // that uniquely exists in one universe, scope the AI call to that
         // universe. If multiple universes match, return an ambiguous result
         // listing candidates so the client can choose.
         const q = String(body.prompt || '').toLowerCase();
-        const universeIds = await persistence.listUniverseIds();
-        const matches: Array<{ universeId: string; universeName: string; charName: string }> = [];
+        const universeIds = await persistence.listWorldIds();
+        const matches: Array<{ worldId: string; worldName: string; charName: string }> = [];
         for (const uid of universeIds) {
           try {
-            const snap = await persistence.loadUniverse(uid);
+            const snap = await persistence.loadWorld(uid);
             const chars = snap.listCharacters();
             for (const c of chars) {
               const name = (c.name || '').toLowerCase();
               // match whole word
               const re = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
               if (re.test(body.prompt)) {
-                matches.push({ universeId: uid, universeName: snap.name, charName: c.name });
+                matches.push({ worldId: uid, worldName: snap.name, charName: c.name });
                 break; // one match per universe is enough
               }
             }
@@ -2559,8 +3762,8 @@ async function interact(){
 
           if (matches.length === 1) {
             const chosen = matches[0];
-            let snapU = await persistence.loadUniverse(chosen.universeId);
-            const events = await persistence.loadEvents(chosen.universeId);
+            let snapU = await persistence.loadWorld(chosen.worldId);
+            const events = await persistence.loadEvents(chosen.worldId);
             // Auto-assign owner if missing (first authenticated user to interact)
             try {
               const currentOwner = typeof snapU.getOwner === 'function' ? snapU.getOwner() : undefined;
@@ -2572,17 +3775,54 @@ async function interact(){
                   timestamp: new Date().toISOString(),
                   payload: { ownerId: actorUser, members: [{ userId: actorUser, role: 'owner' }] },
                 };
-                await persistence.persistEvent(chosen.universeId, assignEv);
-                const updatedU = await persistence.loadUniverse(chosen.universeId);
+                await persistence.persistEvent(chosen.worldId, assignEv);
+                const updatedU = await persistence.loadWorld(chosen.worldId);
                 await persistence.saveSnapshot(updatedU);
                 snapU = updatedU;
               }
             } catch (e) {}
-            const ctx = buildUniverseContext(snapU.snapshot(), events);
+            const ctx = buildWorldContext(snapU.snapshot(), events);
             let messages = [ { role: 'system', content: ctx }, { role: 'user', content: body.prompt } ];
             messages = compactMessages(messages, 120000);
+            
             const ai = await getAiProviderForRequest(req, 'conversation');
-            const r = await ai.generate(body.prompt, { profile: 'conversation', messages });
+            // choose profile/modelOverride: prefer character meta then universe defaults
+            let chosenProfileLocal: any = 'conversation';
+            let modelOverrideLocal: any = undefined;
+            try {
+              // If a character can be resolved from the prompt, prefer its settings
+              let actorIdLocal: string | undefined;
+              try {
+                const chars = snapU.listCharacters();
+                for (const c of chars) {
+                  const name = (c.name || '').replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
+                  const re = new RegExp(`\\b${name}\\b`, 'i');
+                  if (re.test(body.prompt)) { actorIdLocal = c.id; break; }
+                }
+              } catch (e) {}
+              if (actorIdLocal) {
+                const ch = snapU.getCharacter(actorIdLocal as any);
+                if (ch && (ch as any).meta) {
+                  if ((ch as any).meta.aiProfile) chosenProfileLocal = (ch as any).meta.aiProfile;
+                  if ((ch as any).meta.modelOverride) modelOverrideLocal = (ch as any).meta.modelOverride;
+                }
+              }
+              if (snapU && snapU.attributes) {
+                if (!chosenProfileLocal && snapU.attributes.defaultAiProfile) chosenProfileLocal = snapU.attributes.defaultAiProfile;
+                if (!modelOverrideLocal && snapU.attributes.defaultModelOverride) modelOverrideLocal = snapU.attributes.defaultModelOverride;
+              }
+            } catch (e) {}
+            let r;
+            try {
+              const opts: any = { profile: chosenProfileLocal, messages };
+              if (modelOverrideLocal) opts.modelOverride = modelOverrideLocal;
+              r = await ai.generate(body.prompt, opts);
+              } catch (err) {
+                logger.error('ai.generate_failed', { world: chosen.worldId, err: err instanceof Error ? err.message : String(err) });
+                res.writeHead(502, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ error: 'ai_failed', message: err instanceof Error ? err.message : String(err) }));
+                return;
+              }
             try {
               let actorId: string | undefined;
               try {
@@ -2594,12 +3834,12 @@ async function interact(){
                 }
               } catch (e) {}
               const ev = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'ai_response', timestamp: new Date().toISOString(), payload: { actorId, prompt: body.prompt, response: r.text ?? null, raw: r.raw ?? r, messages } };
-              await persistence.persistEvent(chosen.universeId, ev);
+               await persistence.persistEvent(chosen.worldId, ev);
               if (actorId) {
                 const memEv = { id: `${Date.now()}-${Math.random().toString(36).slice(2,6)}`, type: 'character_memory', timestamp: new Date().toISOString(), payload: { characterId: actorId, text: r.text ?? null } };
-                await persistence.persistEvent(chosen.universeId, memEv);
-                logger.info('ai.mem_persisted', { universe: chosen.universeId, characterId: actorId, eventId: memEv.id });
-              }
+                await persistence.persistEvent(chosen.worldId, memEv);
+                logger.info('ai.mem_persisted', { world: chosen.worldId, characterId: actorId, eventId: memEv.id });
+                }
             } catch (err) {
               logger.error('ai.persist_error', { err: err instanceof Error ? err.message : String(err) });
             }
@@ -2619,7 +3859,16 @@ async function interact(){
           {
             const ai = await getAiProviderForRequest(req, 'conversation');
             const messages = [{ role: 'user', content: body.prompt }];
-            const r = await ai.generate(body.prompt, { profile: 'conversation', messages });
+            let r;
+            try {
+              const opts: any = { profile: 'conversation', messages };
+              r = await ai.generate(body.prompt, opts);
+            } catch (err) {
+              logger.error('ai.generate_failed', { err: err instanceof Error ? err.message : String(err) });
+              res.writeHead(502, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: 'ai_failed', message: err instanceof Error ? err.message : String(err) }));
+              return;
+            }
             res.writeHead(200, { 'content-type': 'application/json' });
             res.end(JSON.stringify(r));
             return;
@@ -2669,17 +3918,58 @@ async function interact(){
         } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'revoke_failed' })); return; }
       }
 
+      // List characters across all worlds (search universes for characters)
+      if (req.method === 'GET' && path === '/api/characters') {
+        try {
+          const ids = await persistence.listWorldIds();
+          const out: Array<any> = [];
+          for (const id of ids) {
+            try {
+               const u = await persistence.loadWorld(id);
+              const chars = u.listCharacters();
+               for (const c of chars) {
+                 out.push({ worldId: id, character: c });
+               }
+            } catch (e) { /* ignore per-universe errors */ }
+          }
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ characters: out }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+      }
+
+      // Get info about a character across worlds (find occurrences)
+      if (req.method === 'GET' && path?.startsWith('/api/character/')) {
+        const charId = path.replace('/api/character/', '');
+        try {
+          const ids = await persistence.listWorldIds();
+          const found: Array<any> = [];
+          for (const id of ids) {
+            try {
+               const u = await persistence.loadWorld(id);
+               const ch = u.getCharacter(charId);
+               if (ch) found.push({ worldId: id, character: ch });
+            } catch (e) {}
+          }
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ occurrences: found }));
+          return;
+        } catch (e) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'failed' })); return; }
+      }
+
       // AI endpoint scoped to a universe id (preferred for disambiguation)
-      if (req.method === 'POST' && path?.startsWith('/api/universe/') && path.endsWith('/ai')) {
-        const id = path.replace('/api/universe/', '').replace('/ai', '');
+      if (req.method === 'POST' && path?.startsWith('/api/world/') && path.endsWith('/ai')) {
+        const id = path.replace('/api/world/', '').replace('/ai', '');
         const body = await jsonBody(req);
         const userMessage = body?.message ?? body?.prompt;
         if (!body || !userMessage) {
           res.writeHead(400, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: 'invalid body, expected {message|prompt}' }));
-          return;
-        }
-        let snapU = await persistence.loadUniverse(id);
+        return;
+      }
+
+      
+        let snapU = await persistence.loadWorld(id);
         const events = await persistence.loadEvents(id);
         // Auto-assign owner to first authenticated user that interacts
         try {
@@ -2693,14 +3983,14 @@ async function interact(){
               payload: { ownerId: actorUser, members: [{ userId: actorUser, role: 'owner' }] },
             };
             await persistence.persistEvent(id, assignEv);
-            const updatedU = await persistence.loadUniverse(id);
+            const updatedU = await persistence.loadWorld(id);
             await persistence.saveSnapshot(updatedU);
             snapU = updatedU;
           }
         } catch (e) {
           // ignore
         }
-        const ctx = buildUniverseContext(snapU.snapshot(), events);
+        const ctx = buildWorldContext(snapU.snapshot(), events);
         // Build final prompt: prefer explicit actorId when provided; otherwise try to detect by name
         let finalPrompt = `${ctx}\nUser: ${userMessage}`;
         let actorId: string | undefined = body?.actorId;
@@ -2725,7 +4015,33 @@ async function interact(){
             messages = compactMessages(messages, 120000);
             const ai = await getAiProviderForRequest(req, 'conversation');
             logger.info('ai.request', { universe: id, promptPreview: String(finalPrompt).slice(0, 300) });
-        const r = await ai.generate(finalPrompt, { profile: 'conversation', messages });
+        // choose profile/modelOverride: prefer explicit actor meta, then universe defaults
+        let chosenProfileFinal: any = 'conversation';
+        let modelOverrideFinal: any = undefined;
+        try {
+          if (actorId) {
+            const ch = snapU.getCharacter(actorId);
+            if (ch && (ch as any).meta) {
+              if ((ch as any).meta.aiProfile) chosenProfileFinal = (ch as any).meta.aiProfile;
+              if ((ch as any).meta.modelOverride) modelOverrideFinal = (ch as any).meta.modelOverride;
+            }
+          }
+          if (snapU && snapU.attributes) {
+            if (!chosenProfileFinal && snapU.attributes.defaultAiProfile) chosenProfileFinal = snapU.attributes.defaultAiProfile;
+            if (!modelOverrideFinal && snapU.attributes.defaultModelOverride) modelOverrideFinal = snapU.attributes.defaultModelOverride;
+          }
+        } catch (e) {}
+        let r;
+        try {
+          const opts: any = { profile: chosenProfileFinal, messages };
+          if (modelOverrideFinal) opts.modelOverride = modelOverrideFinal;
+          r = await ai.generate(finalPrompt, opts);
+        } catch (err) {
+          logger.error('ai.generate_failed', { universe: id, err: err instanceof Error ? err.message : String(err) });
+          res.writeHead(502, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'ai_failed', message: err instanceof Error ? err.message : String(err) }));
+          return;
+        }
         logger.info('ai.response', { universe: id, textPreview: String(r.text).slice(0, 300) });
             try {
               try {

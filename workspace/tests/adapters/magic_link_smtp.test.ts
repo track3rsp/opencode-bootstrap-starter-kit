@@ -3,7 +3,9 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-// Top-level mock for nodemailer so Vitest hoists it correctly.
+// Top-level mock for nodemailer so the helper (emailSender) receives the
+// mocked transport regardless of dynamic imports. This ensures the server's
+// lazy import of nodemailer is intercepted by Vitest.
 const sendMailMock = vi.fn(async (opts: any) => ({ messageId: 'msg-1' }));
 vi.mock('nodemailer', () => ({ createTransport: () => ({ sendMail: sendMailMock }) }));
 
@@ -39,9 +41,8 @@ describe('Magic link SMTP (integration)', () => {
   });
 
   it('sends email via nodemailer when SMTP configured', async () => {
-    // mock nodemailer before importing the server module
-    const sendMailMock = vi.fn(async (opts: any) => ({ messageId: 'msg-1' }));
-    vi.mock('nodemailer', () => ({ createTransport: () => ({ sendMail: sendMailMock }) }));
+    // nodemailer is mocked at the top-level for this file so no local mock is
+    // required here. The top-level `sendMailMock` will receive the call.
 
     const exportMod = await import('../../src/adapters/fs/filePersistence');
     const FilePersistenceAdapter = exportMod.FilePersistenceAdapter;
