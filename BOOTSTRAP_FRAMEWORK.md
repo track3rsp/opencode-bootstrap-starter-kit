@@ -2126,6 +2126,31 @@ All future project development must rely exclusively on the documentation genera
 
 
 
+# PROJECT INDEPENDENCE
+
+Once the bootstrap process has completed, the generated project must behave as if it had been created manually.
+
+The Bootstrap Starter Kit becomes irrelevant to the generated project.
+
+The generated repository must never:
+
+mention the Bootstrap Starter Kit
+mention BOOTSTRAP_FRAMEWORK.md
+mention BOOTSTRAP_HANDOFF.md
+mention USER.md
+mention the bootstrap process itself
+describe itself as a generated project
+
+Every generated document, prompt, skill, template and script must appear to belong natively to the project.
+
+The project inherits the development methodology, not the identity of the Bootstrap Starter Kit.
+
+The only responsibility of the generated prompts is to maintain and evolve the generated project.
+
+Future AI agents working inside /workspace should never need to know that the project originated from a Bootstrap Framework.
+
+
+
 # PROMPT PHILOSOPHY
 
 Every prompt represents one phase of the project's lifecycle.
